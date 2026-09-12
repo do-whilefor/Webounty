@@ -1,0 +1,1091 @@
+#!/usr/bin/env python3
+"""本轮 Wiki / 状态 / 封存观察检索；仅标准库，派生缓存限本会话。"""
+
+from __future__ import annotations
+
+import argparse
+from functools import wraps
+import hashlib
+import heapq
+import json
+from pathlib import Path
+import re
+import sys
+
+sys.dont_write_bytecode = True
+
+from methods import select_methods
+from search_index import rank as rank_corpus
+from telemetry import count, measure as stage_measure
+from context_views import (compact_artifact, compact_block, compact_mandatory,
+                           compact_navigation, compact_observation, compact_record)
+
+
+def corpus_stage(name):
+    """Timings are inclusive: package/index may contain verification work."""
+    def decorate(function):
+        @wraps(function)
+        def measured(corpus, *args, **kwargs):
+            metrics = kwargs.get("metrics", getattr(corpus, "metrics", None))
+            with stage_measure(metrics, name):
+                return function(corpus, *args, **kwargs)
+        return measured
+    return decorate
+
+
+class RetrievalError(ValueError):
+    """输入或运行边界不满足读取契约。"""
+
+
+def encode(value):
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def ref_ids(refs):
+    if isinstance(refs, (str, dict)):
+        refs = [refs]
+    return [r if isinstance(r, str) else r["id"] for r in refs]
+
+
+RELATIONS = (
+    "requires", "evidence_refs", "contradicted_by", "step_refs",
+    "supporting_fact_ids", "contradicting_fact_ids", "corrected_by",
+    "correction_refs", "superseded_by", "source_refs", "contradicts",
+)
+CORRECTIONS = ("contradicted_by", "corrected_by", "correction_refs", "superseded_by")
+
+
+def dependencies(record):
+    refs = set()
+    for key in RELATIONS:
+        values = record.get(key, [])
+        refs.update(ref_ids([values] if isinstance(values, str) else values))
+    if record.get("kind") == "Chain":
+        refs.update(ref_ids(record.get("steps", [])))
+        for link in record.get("links", []):
+            refs.update(link[key] for key in ("producer_ref", "consumer_ref") if link.get(key))
+    for entry in record.get("history", []):
+        refs.update(ref_ids(entry.get("evidence_refs", [])))
+    return refs
+
+
+def signature(kind, obj):
+    out = {"kind": kind, "id": obj["id"], "revision": obj["revision"]}
+    if kind == "observation":
+        out["content_hash"] = obj["content_hash"]
+    return out
+
+
+def words(text):
+    terms = set(re.findall(r"[a-z0-9_/-]+", text.casefold()))
+    for phrase in re.findall(r"[\u3400-\u9fff]+", text):
+        terms.update(phrase[i:i + 2] for i in range(len(phrase) - 1))
+    return terms
+
+
+def text_values(value):
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return " ".join(text_values(v) for v in value.values())
+    if isinstance(value, list):
+        return " ".join(text_values(v) for v in value)
+    return str(value)
+
+
+class Corpus:
+    # Read-time caps prevent a malformed local corpus from causing unbounded expansion.
+    MAX_FILE_BYTES = 16 * 1024 * 1024
+    MAX_ITEMS = 12000
+    MAX_TOTAL_BYTES = 64 * 1024 * 1024
+
+    @corpus_stage("load")
+    def __init__(self, root, run_id, *, lazy_pages=False, metrics=None):
+        self.metrics = metrics
+        self.root = Path(root).resolve(strict=True)
+        if not self.root.is_dir() or not run_id:
+            raise RetrievalError("root 必须是本轮资料目录，run_id 不可为空")
+        self.run_id = run_id
+        self.read_files = {}
+        self.total_bytes = 0
+        self.state = self.read_json("state.json")
+        self.load_issues = []
+        # The nested layout is canonical; the root manifest supports early fixtures.
+        self.manifest_path = "wiki/manifest.json"
+        if not self.path(self.manifest_path).exists():
+            self.manifest_path = "manifest.json"
+        try:
+            self.manifest = self.read_json(self.manifest_path)
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            self.manifest = {"run_id": run_id, "pages": []}
+            self.load_issues.append({"code": "manifest_unavailable", "detail": "Wiki 索引不可用，回退当前状态与已登记观察。"})
+        if self.state.get("run_id") != run_id or self.manifest.get("run_id") != run_id:
+            raise RetrievalError("run_id 与 state / manifest 不匹配")
+        self.records = self.state["records"]
+        self.entities = self.state["entities"]
+        self.observations = self.state["observations"]
+        self.artifacts = self.state["artifacts"]
+        self.pages = {}
+        self.blocks = {}
+        self.page_issues = {}
+        self.art_cache = {}
+        self.obs_cache = {}
+        self.check_cache = {}
+        self.line_cache = {}
+        self.closure_cache = {}
+        self.knowledge_check_cache = {}
+        self.reasoning_cache = {}
+        self.subject_index = {}
+        all_ids = set()
+        for name, group in (("records", self.records), ("entities", self.entities),
+                            ("observations", self.observations), ("artifacts", self.artifacts)):
+            if not isinstance(group, dict) or len(group) > self.MAX_ITEMS:
+                raise RetrievalError(f"{name} 不是有效的小型本轮索引")
+            for key, value in group.items():
+                if value.get("id") != key or key in all_ids:
+                    raise RetrievalError("索引 ID 重复或不匹配")
+                all_ids.add(key)
+                if value.get("run_id", run_id) != run_id:
+                    raise RetrievalError("索引混入其他 run_id")
+                kind = {"records": "record", "entities": "entity", "observations": "observation"}.get(name)
+                if kind:
+                    for subject in value.get("subject_refs", []):
+                        self.subject_index.setdefault(subject, set()).add((kind, key))
+        for page in self.manifest["pages"]:
+            pid = page["page_id"]
+            if page.get("run_id") != run_id or pid in self.pages:
+                raise RetrievalError("Wiki 页面 run_id 不匹配或 ID 重复")
+            self.pages[pid] = page
+            self.page_issues[pid] = []
+            for block in page["blocks"]:
+                key = f'{pid}/{block["block_id"]}'
+                if key in self.blocks:
+                    raise RetrievalError("Wiki 块 ID 重复")
+                self.blocks[key] = {**block, "page_id": pid, "text": "", "_issues": []}
+        self.loaded_pages = set()
+        if len(self.blocks) + len(all_ids) > self.MAX_ITEMS:
+            raise RetrievalError("本轮索引超过原型扫描上限，需要缩小导入范围")
+        self.record_dependencies = {rid: dependencies(row) for rid, row in self.records.items()}
+        self.cycle_dependencies = dict(self.record_dependencies)
+        for rid, row in self.records.items():
+            contradicted = set(ref_ids(row.get("contradicts", [])))
+            paired = {target for target in contradicted
+                      if rid in ref_ids(self.records.get(target, {}).get("contradicted_by", []))}
+            if paired:
+                # NEW.contradicts=OLD and OLD.contradicted_by=NEW describe one
+                # relation. Ignore only its explicit inverse for cycle detection;
+                # source_refs/requires/history edges to OLD must still survive.
+                self.cycle_dependencies[rid] = dependencies({
+                    **row, "contradicts": sorted(contradicted - paired)})
+        self.reverse_corrections = {}
+        for rid, row in self.records.items():
+            for field in (*CORRECTIONS, "contradicts"):
+                for target in ref_ids(row.get(field, [])):
+                    self.reverse_corrections.setdefault(target, set()).add(rid)
+        self.derived_paths = {self.path(p["path"]) for p in self.pages.values()}
+        self.derived_paths.update(self.path(p) for p in (
+            "state.json", "manifest.json", "wiki/manifest.json", "wiki-knowledge.json"))
+        self.derived_hashes = {p["content_hash"] for p in self.pages.values()}
+        if not lazy_pages:
+            for pid in self.pages:
+                self.ensure_page(pid)
+
+    @corpus_stage("verification")
+    def ensure_page(self, pid):
+        """Load and verify one page; ranking can reuse other pages' term projections."""
+        if pid in self.loaded_pages:
+            return
+        page = self.pages[pid]
+        issues = self.page_issues[pid]
+        try:
+            raw = self.read_bytes(page["path"])
+            if digest(raw) != page["content_hash"]:
+                issues.append({"code": "page_hash_mismatch", "page_id": pid})
+            content = raw.decode("utf-8")
+        except (OSError, UnicodeError) as exc:
+            content = ""
+            issues.append({"code": "page_missing", "page_id": pid, "detail": str(exc)})
+        anchors = list(re.finditer(r'<a id="([^"]+)"></a>', content))
+        spans = {}
+        for index, match in enumerate(anchors):
+            anchor = match.group(1)
+            if anchor in spans:
+                issues.append({"code": "duplicate_anchor", "page_id": pid})
+            end = anchors[index + 1].start() if index + 1 < len(anchors) else len(content)
+            spans[anchor] = content[match.start():end]
+        for block in page["blocks"]:
+            bid = block["block_id"]
+            body = spans.get(block["anchor"], "")
+            block_issues = []
+            if not body or digest(body.encode()) != block["content_hash"]:
+                block_issues.append({"code": "block_hash_mismatch", "block_id": bid})
+            self.blocks[f"{pid}/{bid}"].update(text=body, _issues=block_issues)
+        self.loaded_pages.add(pid)
+
+    def path(self, relative):
+        p = Path(relative)
+        if p.is_absolute():
+            raise RetrievalError("资料路径必须相对本轮 root")
+        resolved = (self.root / p).resolve()
+        if not resolved.is_relative_to(self.root):
+            raise RetrievalError("资料路径或符号链接越出本轮 root")
+        return resolved
+
+    def read_bytes(self, relative):
+        p = self.path(relative)
+        if p in self.read_files:
+            return self.read_files[p]
+        if p.stat().st_size > self.MAX_FILE_BYTES:
+            raise RetrievalError("单个资料文件超过 16 MiB 原型上限")
+        with p.open("rb") as stream:
+            data = stream.read(self.MAX_FILE_BYTES + 1)
+        if len(data) > self.MAX_FILE_BYTES:
+            raise RetrievalError("读取期间文件超过上限")
+        self.total_bytes += len(data)
+        if self.total_bytes > self.MAX_TOTAL_BYTES:
+            raise RetrievalError("本次读取超过 64 MiB 原型上限")
+        self.read_files[p] = data
+        count(self.metrics, "files_read")
+        count(self.metrics, "bytes_read", len(data))
+        return data
+
+    def read_json(self, relative):
+        return json.loads(self.read_bytes(relative))
+
+    @corpus_stage("verification")
+    def stable(self):
+        # Detect ordinary concurrent changes; a caller still needs a single writer.
+        for path, previous in self.read_files.items():
+            if path.resolve() != path or not path.resolve().is_relative_to(self.root):
+                return False
+            try:
+                with path.open("rb") as stream:
+                    current = stream.read(len(previous) + 1)
+                count(self.metrics, "snapshot_files_read")
+                count(self.metrics, "snapshot_bytes_read", len(current))
+                if current != previous:
+                    return False
+            except OSError:
+                return False
+        return True
+
+    @corpus_stage("verification")
+    def artifact(self, aid):
+        if aid in self.art_cache:
+            return self.art_cache[aid]
+        meta = self.artifacts.get(aid)
+        issues, data = [], None
+        if meta is None:
+            issues.append({"code": "missing_reference", "artifact_id": aid})
+        else:
+            if not meta.get("sealed"):
+                issues.append({"code": "artifact_unsealed", "artifact_id": aid})
+            if meta.get("kind") in {"wiki", "report", "derived", "method"}:
+                issues.append({"code": "derived_source", "artifact_id": aid})
+            try:
+                data = self.read_bytes(meta["path"])
+                count(self.metrics, "artifacts_verified")
+                if digest(data) != meta["sha256"] or len(data) != meta["bytes"]:
+                    issues.append({"code": "artifact_hash_mismatch", "artifact_id": aid})
+                if self.path(meta["path"]) in self.derived_paths or digest(data) in self.derived_hashes:
+                    issues.append({"code": "derived_source", "artifact_id": aid})
+            except OSError:
+                issues.append({"code": "artifact_missing", "artifact_id": aid})
+        result = {"id": aid, "status": "unavailable" if issues else "ready",
+                  "provenance": meta, "issues": issues, "data": data if not issues else None}
+        self.art_cache[aid] = result
+        return result
+
+    def observation(self, oid):
+        if oid in self.obs_cache:
+            return self.obs_cache[oid]
+        index = self.observations[oid]
+        artifact = self.artifact(index["artifact_id"])
+        issues, raw = list(artifact["issues"]), None
+        if index.get("source_artifact_id"):
+            issues.extend(self.artifact(index["source_artifact_id"])["issues"])
+        if artifact["data"] is not None:
+            lines = self.artifact_lines(index["artifact_id"], artifact["data"])
+            number = index.get("line", 0)
+            if not isinstance(number, int) or not 1 <= number <= len(lines):
+                issues.append({"code": "observation_location_missing", "id": oid})
+            else:
+                line = lines[number - 1]
+                if digest(line) != index["content_hash"]:
+                    issues.append({"code": "observation_hash_mismatch", "id": oid})
+                else:
+                    try:
+                        raw = json.loads(line)
+                        count(self.metrics, "observations_decoded")
+                        if raw.get("run_id") != self.run_id:
+                            raise RetrievalError("观察原件混入其他 run_id")
+                        if raw.get("observation_id") != oid:
+                            issues.append({"code": "observation_id_mismatch", "id": oid})
+                    except (json.JSONDecodeError, UnicodeError):
+                        issues.append({"code": "observation_parse_error", "id": oid})
+        out = {"id": oid, "revision": index["revision"], "index": index,
+               "status": "unavailable" if issues else "ready", "raw": raw if not issues else None,
+               "provenance": {"artifact_id": index["artifact_id"],
+                              "path": self.artifacts.get(index["artifact_id"], {}).get("path"),
+                              "line": index.get("line"), "content_hash": index["content_hash"]},
+               "issues": issues}
+        self.obs_cache[oid] = out
+        return out
+
+    def artifact_lines(self, aid, data):
+        if aid not in self.line_cache:
+            self.line_cache[aid] = data.splitlines(keepends=True)
+        return self.line_cache[aid]
+
+    def artifact_reference_issues(self, ref):
+        artifact = self.artifact(ref["artifact_id"])
+        issues = list(artifact["issues"])
+        if "line" in ref and artifact["data"] is not None:
+            line = ref["line"]
+            if not isinstance(line, int) or isinstance(line, bool) or not 1 <= line <= len(self.artifact_lines(ref["artifact_id"], artifact["data"])):
+                issues.append({"code": "artifact_location_missing", "artifact_id": ref["artifact_id"], "line": line})
+        return issues
+
+    def candidates(self, page):
+        scope = page["discovery_scope"]
+        subjects, roots = set(scope["subject_refs"]), set(scope["root_record_refs"])
+        related = {("entity", rid) for rid in subjects if rid in self.entities}
+        related.update(("record", rid) for rid in roots if rid in self.records)
+        for subject in subjects:
+            related.update(self.subject_index.get(subject, ()))
+        # Explicit corrections/refutations can arrive before subject association.
+        linked, _ = self.record_closure(rid for kind, rid in related if kind == "record")
+        related.update(("record", rid) for rid in linked)
+        # Publication marks explicit forward source observations/entities read.
+        # Keep those same current references in scope even without subject tags;
+        # use current records so removed refs and revised signatures still differ
+        # from the page's authored checked_candidates snapshot.
+        for rid in linked:
+            row = self.records[rid]
+            related.update(("observation", oid) for oid in ref_ids(row.get("observation_refs", []))
+                           if oid in self.observations)
+            related.update(("entity", eid) for eid in ref_ids(row.get("subject_refs", []))
+                           if eid in self.entities)
+        groups = {"record": self.records, "observation": self.observations, "entity": self.entities}
+        result = [signature(kind, groups[kind][rid]) for kind, rid in sorted(related)]
+        return sorted(result, key=encode)
+
+    def source_issues(self, refs):
+        issues = []
+        for ref in refs:
+            rid = ref if isinstance(ref, str) else ref["id"]
+            row = self.records.get(rid) or self.entities.get(rid)
+            if row is None:
+                issues.append({"code": "missing_reference", "id": rid})
+            elif isinstance(ref, dict) and row["revision"] != ref["revision"]:
+                issues.append({"code": "stale_source", "id": rid,
+                               "expected": ref["revision"], "current": row["revision"]})
+        return issues
+
+    def page_check(self, pid):
+        self.ensure_page(pid)
+        if pid in self.check_cache:
+            return self.check_cache[pid]
+        page = self.pages[pid]
+        issues = list(self.page_issues[pid]) + self.source_issues(page["source_refs"])
+        old = {encode(x): x for x in page["checked_candidates"]}
+        now = {encode(x): x for x in self.candidates(page)}
+        new = [now[k] for k in sorted(now.keys() - old.keys())]
+        removed = [old[k] for k in sorted(old.keys() - now.keys())]
+        if new:
+            issues.append({"code": "new_candidates", "count": len(new)})
+        if removed:
+            issues.append({"code": "removed_candidates", "count": len(removed)})
+        for block in page["blocks"]:
+            issues.extend(self.blocks[f'{pid}/{block["block_id"]}']["_issues"])
+            issues.extend(self.source_issues(block["source_refs"]))
+            for ref in block.get("artifact_refs", []):
+                issues.extend(self.artifact_reference_issues(ref))
+        conditions = page.get("conditions", {})
+        subjects = set(page["discovery_scope"]["subject_refs"])
+        for goal in self.records.values():
+            if goal.get("kind") != "Goal" or goal.get("status") != "active":
+                continue
+            if subjects.intersection(goal.get("subject_refs", [])):
+                current = goal.get("scope", {})
+                for axis in ("environment", "session_generation"):
+                    if axis in current and axis in conditions and current[axis] != conditions[axis]:
+                        issues.append({"code": "condition_change", "axis": axis,
+                                       "previous": conditions[axis], "current": current[axis]})
+        for candidate in now.values():
+            if candidate["kind"] != "observation":
+                continue
+            obs = self.observation(candidate["id"])
+            issues.extend(obs["issues"])
+            if obs["raw"]:
+                for axis in ("environment", "session_generation"):
+                    if axis in obs["raw"] and axis in conditions and obs["raw"][axis] != conditions[axis]:
+                        issues.append({"code": "condition_change", "axis": axis, "id": obs["id"]})
+        unique = {encode(i): i for i in issues}
+        issues = [unique[k] for k in sorted(unique)]
+        bad = {"page_missing", "page_hash_mismatch", "block_hash_mismatch", "duplicate_anchor"}
+        status = "unavailable" if any(i["code"] in bad for i in issues) else "review_required" if issues else "ready"
+        out = {"page_id": pid, "status": status, "issues": issues,
+               "new_candidates": new, "removed_candidates": removed}
+        self.check_cache[pid] = out
+        return out
+
+    def block_closure(self, keys):
+        pending, found, issues = list(keys), set(), []
+        while pending:
+            key = pending.pop()
+            if key in found:
+                continue
+            if key not in self.blocks:
+                issues.append({"code": "missing_reference", "block_ref": key})
+                continue
+            found.add(key)
+            block = self.blocks[key]
+            refs = block.get("required_block_refs", [])
+            if block.get("role") == "history" and not refs:
+                issues.append({"code": "history_without_correction", "block_ref": key})
+            pending.extend(f'{r["page_id"]}/{r["block_id"]}' for r in refs)
+        return found, issues
+
+    def record_closure(self, seeds):
+        key = tuple(sorted(set(seeds)))
+        if key in self.closure_cache:
+            return self.closure_cache[key]
+        pending, found, issues = list(key), set(), []
+        while pending:
+            rid = pending.pop()
+            if rid in found:
+                continue
+            if rid not in self.records:
+                issues.append({"code": "missing_reference", "id": rid})
+                continue
+            found.add(rid)
+            pending.extend(self.record_dependencies[rid] | self.reverse_corrections.get(rid, set()))
+        # Detect evidence dependency cycles, excluding generated reverse lookups
+        # and an explicitly paired contradiction inverse. Closure keeps both ends.
+        colors = {}
+        for start in sorted(found):
+            if colors.get(start):
+                continue
+            stack = [(start, False)]
+            while stack:
+                rid, leaving = stack.pop()
+                if leaving:
+                    colors[rid] = 2
+                    continue
+                if colors.get(rid) == 2:
+                    continue
+                if colors.get(rid) == 1:
+                    issues.append({"code": "dependency_cycle", "id": rid})
+                    continue
+                colors[rid] = 1
+                stack.append((rid, True))
+                stack.extend((target, False) for target in sorted(self.cycle_dependencies[rid] & found, reverse=True))
+        self.closure_cache[key] = (found, issues)
+        return found, issues
+
+    @corpus_stage("package")
+    def package(self, block_keys=(), record_ids=(), observation_ids=(), entity_ids=(),
+                *, view="evidence", _validate_knowledge=True, _expand_artifacts=True):
+        """Build the requested view while verifying the same complete source closure.
+
+        Knowledge checks use full observations internally, without decoding source
+        artifact text merely to discard it from a compact response.
+        """
+        if view not in {"compact", "evidence"}:
+            raise ValueError("view must be compact or evidence")
+        bkeys, issues = self.block_closure(block_keys)
+        seeds = set(record_ids)
+        eids = set(entity_ids)
+        oids = set(observation_ids)
+        blocks, checks = [], []
+        for key in sorted(bkeys):
+            block = self.blocks[key]
+            page = self.pages[block["page_id"]]
+            check = self.page_check(page["page_id"])
+            if check["status"] == "unavailable":
+                issues.extend(check["issues"])
+                return None, issues
+            checks.append(check)
+            for rid in ref_ids(block["source_refs"]):
+                (eids if rid in self.entities else seeds).add(rid)
+            blocks.append({k: v for k, v in block.items() if not k.startswith("_")
+                           and not (view == "compact" and block.get("representation") == "record" and k == "text")})
+            blocks[-1].update(status=check["status"], path=page["path"],
+                              conditions={**page.get("conditions", {}), **block.get("conditions", {})},
+                              evidence_role="derived_explanation")
+            if view == "compact":
+                blocks[-1] = compact_block(self, blocks[-1])
+        rids, processed_entities = set(), set()
+        # Close only explicit provenance and ownership edges, never similarity edges.
+        while True:
+            current_rids, more = self.record_closure(seeds)
+            issues.extend(more)
+            rids.update(current_rids)
+            for rid in current_rids:
+                eids.update(self.records[rid].get("subject_refs", []))
+                oids.update(self.records[rid].get("observation_refs", []))
+                if self.records[rid].get("kind") == "Chain":
+                    for link in self.records[rid].get("links", []):
+                        oids.update(ref_ids(link.get("evidence_refs", [])))
+            for oid in oids:
+                eids.update(self.observations.get(oid, {}).get("subject_refs", []))
+            pending_entities = eids - processed_entities
+            if not pending_entities:
+                break
+            for eid in sorted(pending_entities):
+                entity = self.entities.get(eid)
+                if entity is None:
+                    issues.append({"code": "missing_reference", "id": eid})
+                    continue
+                seeds.update(ref_ids(entity.get("source_refs", [])))
+                for field in ("owner_ref", "tenant_ref", "asset_ref"):
+                    if entity.get(field):
+                        eids.add(entity[field])
+            processed_entities.update(pending_entities)
+        if any(i["code"] in {"missing_reference", "history_without_correction", "dependency_cycle"} for i in issues):
+            return None, issues
+        artifact_ids = set()
+        for rid in rids:
+            row = self.records[rid]
+            if row.get("kind") == "Fact" and not (row.get("observation_refs") or row.get("artifact_refs") or row.get("source_refs")):
+                issues.append({"code": "fact_without_source", "id": rid})
+            oids.update(row.get("observation_refs", []))
+            eids.update(row.get("subject_refs", []))
+            for ref in row.get("artifact_refs", []):
+                artifact_ids.add(ref["artifact_id"])
+                issues.extend(self.artifact_reference_issues(ref))
+        for block in blocks:
+            artifact_ids.update(r["artifact_id"] for r in block.get("artifact_refs", []))
+            for ref in block.get("artifact_refs", []):
+                issues.extend(self.artifact_reference_issues(ref))
+        observations = []
+        for oid in sorted(oids):
+            if oid not in self.observations:
+                return None, issues + [{"code": "missing_reference", "id": oid}]
+            obs = self.observation(oid)
+            observations.append(compact_observation(obs) if view == "compact" else obs)
+            if view == "evidence" and obs["raw"] is not None:
+                count(self.metrics, "packaged_raw_observations" if _expand_artifacts
+                      else "validation_raw_observations")
+            issues.extend(obs["issues"])
+            eids.update(obs["index"].get("subject_refs", []))
+            artifact_ids.add(obs["index"]["artifact_id"])
+            if obs["index"].get("source_artifact_id"):
+                artifact_ids.add(obs["index"]["source_artifact_id"])
+        artifacts = []
+        for aid in sorted(artifact_ids):
+            artifact = self.artifact(aid)
+            issues.extend(artifact["issues"])
+            artifacts.append(compact_artifact(artifact) if view == "compact"
+                             else {k: v for k, v in artifact.items() if k != "data"})
+            if (view == "evidence" and _expand_artifacts and artifact["data"]
+                    and not any(o["index"]["artifact_id"] == aid for o in observations)):
+                try:
+                    count(self.metrics, "source_text_expansions")
+                    artifacts[-1]["content"] = artifact["data"].decode("utf-8")
+                    count(self.metrics, "source_text_chars", len(artifacts[-1]["content"]))
+                except UnicodeError:
+                    issues.append({"code": "non_text_artifact", "artifact_id": aid})
+        for eid in eids:
+            if eid not in self.entities:
+                issues.append({"code": "missing_reference", "id": eid})
+        if _validate_knowledge:
+            for key in sorted(bkeys):
+                if "knowledge" not in self.blocks[key]:
+                    continue
+                if key not in self.knowledge_check_cache:
+                    # Lazy import avoids the Wiki audit module's dependency on
+                    # Corpus and costs nothing for unannotated legacy blocks.
+                    from wiki import validate_block_knowledge
+                    own_package, more = self.package(block_keys=[key], _validate_knowledge=False,
+                                                     _expand_artifacts=False)
+                    if own_package is None:
+                        return None, issues + more
+                    with stage_measure(self.metrics, "verification"):
+                        self.knowledge_check_cache[key] = validate_block_knowledge(self, key, own_package)
+                issues.extend(self.knowledge_check_cache[key])
+            if any(issue["code"].startswith("knowledge_") for issue in issues):
+                return None, issues
+            for block in blocks:
+                key = block["page_id"] + "/" + block["block_id"]
+                if key in self.reasoning_cache:
+                    block["reasoning"] = self.reasoning_cache[key]
+        return {"blocks": blocks, "records": [compact_record(self.records[r]) if view == "compact"
+                                               else self.records[r] for r in sorted(rids)],
+                "observations": observations, "entities": [self.entities[e] for e in sorted(eids) if e in self.entities],
+                "artifacts": artifacts, "page_checks": checks}, issues
+
+
+@corpus_stage("index")
+def search(corpus, query, anchors, *, with_exact=False, with_reasons=False):
+    """Rank complete evidence units; lexical relevance does not establish truth."""
+    return rank_corpus(corpus, query, anchors, with_exact=with_exact, with_reasons=with_reasons)
+
+
+def cross_candidates(corpus, observations, limit):
+    original = [corpus.observation(row["id"]) if "raw" not in row else row for row in observations]
+    valid = [row for row in original if row["raw"] is not None]
+    subjects, dimensions, by_subject = [], [], {}
+    object_patterns = [(eid, re.compile(r"(?<![\w-])" + re.escape(eid) + r"(?![\w-])"))
+                       for eid, entity in corpus.entities.items() if entity.get("kind") == "object"]
+    # Compute each observation's dimensions once, then compare only shared-subject pairs.
+    for index, observation in enumerate(valid):
+        raw = observation["raw"]
+        refs = set(observation["index"].get("subject_refs", []))
+        shared = {eid for eid in refs if corpus.entities.get(eid, {}).get("kind") in {"object", "endpoint", "flow"}}
+        subjects.append(shared)
+        for eid in shared:
+            by_subject.setdefault(eid, set()).add(index)
+        dims = {axis: raw.get(axis) for axis in ("actor_ref", "environment", "session_generation", "stage", "signal_kind")}
+        dims["endpoint"] = sorted(eid for eid in refs if corpus.entities.get(eid, {}).get("kind") == "endpoint")
+        request = raw.get("request", {})
+        request_text = encode(request)
+        dims["object"] = sorted(set(raw.get("request_object_refs", [])) |
+                                {eid for eid, pattern in object_patterns if pattern.search(request_text)})
+        dims["request_method"] = request.get("method")
+        dims["request_input"] = {key: value for key, value in request.items() if key != "auth_ref"}
+        dimensions.append(dims)
+
+    count = 0
+
+    def pairs():
+        nonlocal count
+        for index, left in enumerate(valid):
+            related = set()
+            for eid in subjects[index]:
+                related.update(by_subject[eid])
+            for other in sorted(i for i in related if i > index):
+                right = valid[other]
+                a, b = left["raw"], right["raw"]
+                dims_a, dims_b = dimensions[index], dimensions[other]
+                shared = sorted(subjects[index] & subjects[other])
+                changed = sorted(key for key in dims_a if dims_a[key] != dims_b[key])
+                difference = a.get("response") != b.get("response")
+                if not changed and not difference:
+                    continue
+                same_input = bool(a.get("request", {}).get("url")) and dims_a["request_input"] == dims_b["request_input"]
+                specific = any(corpus.entities[eid]["kind"] in {"object", "endpoint"} for eid in shared)
+                count += 1
+                yield {"left_ref": left["id"], "right_ref": right["id"],
+                       "relation": "same_request_input" if same_input else "shared_subject" if specific else "same_flow",
+                       "shared_refs": shared, "changed_axes": changed,
+                       "request_object_refs": {left["id"]: dims_a["object"], right["id"]: dims_b["object"]},
+                       "response_difference": difference,
+                       "note": "对照候选；共同实体不证明因果，条件差异需由 LLM 评估。"}
+
+    result = heapq.nsmallest(limit, pairs(), key=lambda c: (
+        c["relation"] != "same_request_input", c["relation"] == "same_flow",
+        len(c["changed_axes"]), c["left_ref"], c["right_ref"]))
+    return result, count - len(result)
+
+
+def retrieve(root, run_id, query, anchors=(), budget_chars=None, max_candidates=None,
+             *, include_methods=False, method_ids=(), method_intents=(), cross_limit=0,
+             view="evidence", cursor=None, refresh=False, metrics=None):
+    if not isinstance(query, str) or (not query.strip() and not anchors):
+        raise RetrievalError("query 或 anchor 至少提供一项")
+    if budget_chars is not None and (isinstance(budget_chars, bool) or not isinstance(budget_chars, int) or budget_chars < 1024):
+        raise RetrievalError("budget_chars 必须为空或不小于 1024 的整数")
+    if max_candidates is not None and (isinstance(max_candidates, bool) or not isinstance(max_candidates, int) or max_candidates < 1):
+        raise RetrievalError("max_candidates 必须为空或正整数")
+    if isinstance(cross_limit, bool) or not isinstance(cross_limit, int) or cross_limit < 0:
+        raise RetrievalError("cross_limit 必须为非负整数；0 表示不运行观察两两对照")
+    try:
+        corpus = Corpus(root, run_id, lazy_pages=True, metrics=metrics)
+        method_units, method_issues = (select_methods(query, method_ids, intents=method_intents)
+                                      if include_methods or method_ids or method_intents else ([], []))
+        result = _retrieve(corpus, query, list(anchors), budget_chars, max_candidates,
+                           method_units, method_issues, cross_limit=cross_limit, related_only=view == "compact",
+                           view=view)
+        from context_views import finalize_context
+        with stage_measure(metrics, "context_view"):
+            return finalize_context(corpus, result, view=view, cursor=cursor, refresh=refresh)
+    except RetrievalError:
+        raise
+    except (OSError, KeyError, TypeError, AttributeError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RetrievalError(f"资料结构无法读取：{exc}") from exc
+
+
+def _retrieve(corpus, query, anchors, budget_chars, max_candidates,
+              method_units=(), method_issues=(), *, cross_limit=0, related_only=False, view="evidence"):
+    from discovery import discover
+
+    ranked, search_issues, exact, reasons = search(corpus, query, anchors, with_exact=True, with_reasons=True)
+    # Scan the full session BEFORE lexical/candidate/output limits. Relation discovery
+    # is not restricted to observations which happened to fit the returned package.
+    discovery_anchors = list(dict.fromkeys(anchors + [key for kind, key in sorted(exact) if kind == "record"]))
+    with stage_measure(corpus.metrics, "discovery"):
+        chain = discover(corpus, query=query, anchors=discovery_anchors)
+    relation_keys = [("record", rid) for rid in chain.get("record_refs", []) if rid in corpus.records]
+    for key in relation_keys:
+        reasons.setdefault(key, []).append({"kind": "capability_relation"})
+    explicit = [key for key in ranked if any(r["kind"] == "exact_anchor" for r in reasons.get(key, []))]
+    exact_order = explicit + [key for key in ranked if key in exact and key not in explicit]
+    relation_ids = {key for _, key in relation_keys}
+    related_blocks = [("block", key) for key, block in corpus.blocks.items()
+                      if relation_ids.intersection(ref_ids(block.get("source_refs", [])))]
+    for key in related_blocks:
+        reasons.setdefault(key, []).append({"kind": "capability_source"})
+    rank_positions = {key: index for index, key in enumerate(ranked)}
+    goals = [r for r in corpus.records.values() if r.get("kind") == "Goal" and r.get("status") == "active"]
+    blockers = [r for r in corpus.records.values() if r.get("kind") == "Step" and r.get("status") == "blocked"]
+    diagnostics = list(corpus.load_issues) + list(search_issues) + list(method_issues) + list(chain.get("issues", []))
+    navigation, fresh_keys, unclassified_keys, checks = [], [], [], []
+    relevant_pages = sorted({corpus.blocks[key]["page_id"] for kind, key in ranked + related_blocks if kind == "block"})
+    # Preserve freshness scanning independently of packing limits. Global uncertain
+    # material is surfaced after exact requests, needed relations and normal hits.
+    for pid in relevant_pages:
+        check = corpus.page_check(pid)
+        checks.append(check)
+        navigation.append({"page_id": pid, "path": corpus.pages[pid]["path"], "status": check["status"]})
+        diagnostics.extend({**issue, "page_id": pid} for issue in check["issues"])
+        for candidate in check["new_candidates"]:
+            key = candidate["kind"], candidate["id"]
+            fresh_keys.append(key)
+            reasons.setdefault(key, []).append({"kind": "new_page_source", "page_id": pid})
+    relevant = set(ranked + relation_keys + related_blocks + fresh_keys)
+    seeds = {rid for kind, rid in relevant if kind == "record"}
+    seeds.update(row["id"] for row in goals + blockers)
+    for kind, key in relevant:
+        if kind == "block":
+            seeds.update(ref_ids(corpus.blocks[key].get("source_refs", [])))
+    source_ids, _ = corpus.record_closure(seeds)
+    relevant.update(("record", rid) for rid in source_ids)
+    for rid in source_ids:
+        relevant.update(("observation", oid) for oid in corpus.records[rid].get("observation_refs", []))
+        relevant.update(("entity", eid) for eid in corpus.records[rid].get("subject_refs", []))
+    outside_unclassified = 0
+    for kind, group in (("record", corpus.records), ("observation", corpus.observations), ("entity", corpus.entities)):
+        for rid, row in sorted(group.items()):
+            uncertain = row.get("classification") in {"unclassified", "uncertain", "unlinked"}
+            uncertain |= kind == "observation" and not row.get("subject_refs")
+            if uncertain and related_only and (kind, rid) not in relevant:
+                outside_unclassified += 1
+                continue
+            if uncertain:
+                diagnostics.append({"code": "unclassified", "kind": kind, "id": rid})
+                unclassified_keys.append((kind, rid))
+                reasons.setdefault((kind, rid), []).append({"kind": "unclassified_review"})
+    if outside_unclassified:
+        diagnostics.append({"code": "unclassified_outside_query", "count": outside_unclassified,
+                            "detail": "本会话另有未关联资料，未作为当前问题证据返回；仍可全库检索或按 ID 读取。"})
+    for goal in goals:
+        for rid in goal.get("unclassified_record_refs", []):
+            kind = "observation" if rid in corpus.observations else "entity" if rid in corpus.entities else "record"
+            diagnostics.append({"code": "unclassified", "kind": kind, "id": rid})
+            unclassified_keys.append((kind, rid))
+            reasons.setdefault((kind, rid), []).append({"kind": "unclassified_review"})
+    if not ranked and not relation_keys:
+        diagnostics.append({"code": "no_hit", "detail": "没有定位到相关资料；不表示反证或已覆盖。"})
+        navigation = [{"page_id": pid, "path": page["path"], "retrieval_reason": "仅目录导航，未命中"}
+                      for pid, page in sorted(corpus.pages.items())]
+    ordered = list(dict.fromkeys(exact_order + relation_keys + related_blocks + ranked + fresh_keys + unclassified_keys))
+    out = {"run_id": corpus.run_id, "state_revision": corpus.state["revision"], "query": query,
+           "status": "ready", "mandatory_context": {"goals": goals, "blockers": blockers},
+           "blocks": [], "records": [], "observations": [], "entities": [], "artifacts": [],
+           "cross_candidates": [], "page_checks": [], "methods": [], "method_navigation": [],
+           "chain_discovery": {"candidates": [], "paths": [], "combinations": [], "type_reviews": [],
+                               "record_refs": [], "issues": []},
+           "retrieval_reasons": [], "gaps": [], "navigation": [], "omissions": [],
+           "budget": {"limit_chars": budget_chars, "used_chars": 0, "omitted_units": 0}}
+    if view == "compact":
+        out["view"] = view
+        out["mandatory_context"] = compact_mandatory(out["mandatory_context"])
+    missing_mandatory = False
+    failures, omissions = {}, []
+    unlimited = budget_chars is None
+    limit = float("inf") if budget_chars is None else budget_chars
+    reserve = 450 if budget_chars is not None else 0
+    size_cache = {}
+    package_accumulators = {field: {} for field in (
+        "blocks", "records", "observations", "entities", "artifacts", "page_checks")}
+
+    def row_size(row):
+        key = id(row)
+        if key not in size_cache:
+            size_cache[key] = (row, len(encode(row)))
+        return size_cache[key][1]
+
+    def measure(value):
+        size = 2 + max(0, len(value) - 1)
+        for field, content in value.items():
+            size += row_size(field) + 1
+            if isinstance(content, list):
+                size += 2 + max(0, len(content) - 1) + sum(row_size(row) for row in content)
+            elif field == "budget":
+                size += len(encode(content))
+            else:
+                size += row_size(content)
+        fixed = size - len(str(value["budget"]["used_chars"]))
+        while fixed + len(str(size)) != size:
+            size = fixed + len(str(size))
+        value["budget"]["used_chars"] = size
+        return size
+
+    def fits(value):
+        return unlimited or measure(value) <= limit - reserve
+
+    def package_keys(value):
+        keys = {("block", row["page_id"] + "/" + row["block_id"]) for row in value["blocks"]}
+        for kind, field in (("record", "records"), ("observation", "observations"), ("entity", "entities")):
+            keys.update((kind, row["id"]) for row in value[field])
+        return keys
+
+    def merge_package(base, package):
+        if unlimited:
+            # Every accepted package retains its complete source closure. Accumulate
+            # by identity and sort once, rather than rebuilding every earlier list.
+            for field, rows in package.items():
+                merged = package_accumulators[field]
+                for row in rows:
+                    key = row.get("id") or (row["page_id"], row.get("block_id", ""))
+                    if key not in merged:
+                        base[field].append(row)
+                    merged[key] = row
+            return base
+        result = {**base, "budget": dict(base["budget"])}
+        for field, rows in package.items():
+            def identity(row):
+                return row.get("id") or (row["page_id"], row.get("block_id", ""))
+            merged = {identity(row): row for row in result[field]}
+            merged.update({identity(row): row for row in rows})
+            if field == "blocks":
+                result[field] = sorted(merged.values(), key=lambda row: (
+                    rank_positions.get(("block", row["page_id"] + "/" + row["block_id"]), len(ranked)), str(identity(row))))
+            else:
+                result[field] = sorted(merged.values(), key=lambda row: str(identity(row)))
+        return result
+
+    mandatory, issues = corpus.package(record_ids=[r["id"] for r in goals + blockers], view=view)
+    diagnostics.extend(issues)
+    if mandatory is not None and fits(trial := merge_package(out, mandatory)):
+        out = trial
+    else:
+        missing_mandatory = True
+        out["mandatory_context"] = {"goal_refs": [r["id"] for r in goals], "blocker_refs": [r["id"] for r in blockers]}
+        diagnostics.append({"code": "mandatory_context_unavailable"})
+        omissions.append({"kind": "mandatory_context", "reason": "budget_exhausted" if mandatory is not None else "invalid_source"})
+    covered = package_keys(out)
+    considered = ordered[:max_candidates]
+    if not missing_mandatory:
+        arguments = {"block": "block_keys", "record": "record_ids", "observation": "observation_ids", "entity": "entity_ids"}
+        for key in considered:
+            if key in covered:
+                continue
+            package, issues = corpus.package(**{arguments[key[0]]: [key[1]]}, view=view)
+            diagnostics.extend(issues)
+            if package is None:
+                failures[key] = "invalid_source"
+            elif fits(trial := merge_package(out, package)):
+                out = trial
+                covered.update(package_keys(package))
+            else:
+                failures[key] = "budget_exhausted"
+    if unlimited:
+        for field, merged in package_accumulators.items():
+            if field == "blocks":
+                out[field] = sorted(merged.values(), key=lambda row: (
+                    rank_positions.get(("block", row["page_id"] + "/" + row["block_id"]), len(ranked)),
+                    str((row["page_id"], row.get("block_id", "")))))
+            else:
+                out[field] = [merged[key] for key in sorted(merged, key=str)]
+    # Count omissions only after complete dependency packages have been admitted:
+    # a below-cutoff record may already be present as another record's evidence.
+    for key in ordered:
+        if key not in covered:
+            reason = "mandatory_context_unavailable" if missing_mandatory else failures.get(key, "candidate_limit")
+            omissions.append({"kind": key[0], "id": key[1], "reason": reason})
+    candidate_omitted = sum(row["reason"] == "candidate_limit" for row in omissions)
+    if candidate_omitted:
+        diagnostics.append({"code": "candidate_limit", "omitted": candidate_omitted})
+
+    def append_optional(field, row, *, identity=None):
+        nonlocal out
+        if unlimited:
+            out[field].append(row)
+            return True
+        trial = {**out, "budget": dict(out["budget"]), field: [*out[field], row]}
+        if fits(trial):
+            out = trial
+            return True
+        omissions.append({"kind": field, "id": identity or row.get("id", ""), "reason": "budget_exhausted"})
+        return False
+
+    # Compact graph explanations follow evidence, so a large discovery graph cannot
+    # evict an explicitly requested observation under an optional caller budget.
+    for field in ("candidates", "combinations", "type_reviews", "paths", "record_refs", "issues"):
+        if unlimited:
+            out["chain_discovery"][field] = list(chain.get(field, []))
+            continue
+        for index, row in enumerate(chain.get(field, [])):
+            trial_chain = {**out["chain_discovery"], field: [*out["chain_discovery"][field], row]}
+            trial = {**out, "budget": dict(out["budget"]), "chain_discovery": trial_chain}
+            if fits(trial):
+                out = trial
+            else:
+                omissions.append({"kind": "chain_discovery." + field, "id": str(index), "reason": "budget_exhausted"})
+    # Explain both direct retrieval and provenance which travelled with a unit.
+    for kind, key in sorted(covered):
+        append_optional("retrieval_reasons", {"kind": kind, "id": key,
+                        "reasons": reasons.get((kind, key), [{"kind": "required_context"}])}, identity=key)
+    if cross_limit and not missing_mandatory:
+        # Optional diagnostic only: compare observations related to actual hits and
+        # capability candidates, never all globally unclassified material.
+        focus = set()
+        for kind, key in set(ranked + relation_keys):
+            if kind == "observation":
+                focus.add(key)
+            elif kind == "record":
+                focus.update(corpus.records[key].get("observation_refs", []))
+            elif kind == "block":
+                for rid in ref_ids(corpus.blocks[key].get("source_refs", [])):
+                    focus.update(corpus.records.get(rid, {}).get("observation_refs", []))
+        observations = [row for row in out["observations"] if row["id"] in focus]
+        cross, cross_omitted = cross_candidates(corpus, observations, cross_limit)
+        if cross_omitted:
+            diagnostics.append({"code": "cross_candidate_limit", "omitted": cross_omitted})
+            omissions.append({"kind": "cross_candidates", "reason": "cross_candidate_limit", "count": cross_omitted})
+        for row in cross:
+            append_optional("cross_candidates", row, identity=row["left_ref"] + "/" + row["right_ref"])
+    for unit in method_units:
+        if missing_mandatory:
+            loaded = False
+            reason = "mandatory_context_unavailable"
+            omissions.append({"kind": "methods", "id": unit["id"], "reason": reason})
+        else:
+            loaded = append_optional("methods", unit)
+            reason = "budget_exhausted"
+        if not loaded:
+            diagnostics.append({"code": "method_not_loaded", "id": unit["id"], "reason": reason})
+            append_optional("method_navigation", {"id": unit["id"], "path": unit["path"], "reason": reason}, identity=unit["id"])
+    seen_pages = {row["page_id"] for row in out["page_checks"]}
+    for check in checks:
+        if check["page_id"] not in seen_pages:
+            append_optional("page_checks", check, identity=check["page_id"])
+    for row in navigation:
+        if view == "compact":
+            row = compact_navigation(corpus, row)
+        append_optional("navigation", row, identity=row["page_id"])
+
+    if not corpus.stable():
+        # Clear every derived claim, including graph suggestions, from a mixed snapshot.
+        for field in ("blocks", "records", "observations", "entities", "artifacts", "cross_candidates", "page_checks", "retrieval_reasons"):
+            out[field] = []
+        out["chain_discovery"] = {"candidates": [], "paths": [], "combinations": [], "type_reviews": [],
+                                  "record_refs": [], "issues": []}
+        out["mandatory_context"] = compact_mandatory({}) if view == "compact" else {}
+        diagnostics.append({"code": "snapshot_changed", "detail": "读取期间资料改变，请重试。"})
+    if any(row["reason"] == "budget_exhausted" for row in omissions):
+        diagnostics.append({"code": "budget_exhausted", "detail": "部分完整材料未返回；用精确 anchor 补取或增加预算，不能据遗漏下结论。"})
+    unique = {encode(row): row for row in diagnostics}
+    diagnostics = list(unique.values())
+    # Detailed diagnostics also respect an explicit output budget. Counts of omitted
+    # details remain visible; global unclassified alerts cannot displace exact evidence.
+    hidden_diagnostics = 0
+    for row in diagnostics:
+        if unlimited:
+            out["gaps"].append(row)
+            continue
+        trial = {**out, "budget": dict(out["budget"]), "gaps": [*out["gaps"], row]}
+        if fits(trial):
+            out = trial
+        else:
+            hidden_diagnostics += 1
+    critical_codes = {row["code"] for row in diagnostics} & {
+        "budget_exhausted", "mandatory_context_unavailable", "snapshot_changed", "candidate_limit"
+    }
+    present_codes = {row["code"] for row in out["gaps"]}
+    out["gaps"].extend({"code": code} for code in sorted(critical_codes - present_codes))
+    if hidden_diagnostics:
+        out["gaps"].append({"code": "diagnostic_details_omitted", "count": hidden_diagnostics,
+                            "codes": sorted({row["code"] for row in diagnostics})})
+    # Omission counts are exact even when their full IDs do not fit the caller's
+    # requested budget. This is an output-size option, never a model token limit.
+    total_omissions = sum(row.get("count", 1) for row in omissions)
+    hidden_omissions = 0
+    for row in omissions:
+        if unlimited:
+            out["omissions"].append(row)
+            continue
+        trial = {**out, "budget": dict(out["budget"]), "omissions": [*out["omissions"], row]}
+        if fits(trial):
+            out = trial
+        else:
+            hidden_omissions += row.get("count", 1)
+    out["budget"]["omitted_units"] = total_omissions
+    if hidden_omissions:
+        out["budget"]["omitted_details"] = hidden_omissions
+    out["status"] = "review_required" if diagnostics or omissions else "ready"
+    fatal = missing_mandatory or any(row["code"] == "snapshot_changed" for row in diagnostics)
+    if fatal or not any(out[field] for field in ("blocks", "records", "observations", "entities")):
+        out["status"] = "unavailable"
+    if not unlimited and measure(out) > limit:
+        # The tiny-budget response cannot carry complete required evidence. Return
+        # navigation and explicit diagnostics rather than partial claims.
+        out = {"run_id": corpus.run_id, "state_revision": corpus.state["revision"], "status": "unavailable",
+               "blocks": [], "records": [], "observations": [], "entities": [], "artifacts": [],
+               "cross_candidates": [], "page_checks": [], "mandatory_context": {},
+               "methods": [], "method_navigation": [], "retrieval_reasons": [],
+               "chain_discovery": {"candidates": [], "paths": [], "combinations": [], "type_reviews": [],
+                                   "record_refs": [], "issues": []},
+               "navigation": [], "omissions": [],
+               "gaps": [{"code": "budget_exhausted", "detail": "必要材料和诊断超过输出预算，请增加预算后重试。"}],
+               "budget": {"limit_chars": budget_chars, "used_chars": 0,
+                          "omitted_units": total_omissions + len(covered), "omitted_details": total_omissions + len(covered)}}
+        for row in navigation:
+            trial = {**out, "budget": dict(out["budget"]), "navigation": [*out["navigation"], row]}
+            if measure(trial) <= limit:
+                out = trial
+        if measure(out) > limit:
+            raise RetrievalError("运行标识本身已超过输出预算")
+    if not out["navigation"] and navigation:
+        row = {key: navigation[0][key] for key in ("page_id", "path")}
+        if out.get("view") == "compact":
+            row = compact_navigation(corpus, row)
+        trial = {**out, "budget": dict(out["budget"]), "navigation": [row]}
+        if measure(trial) <= limit:
+            out = trial
+    # Native compact output is sized once by finalize_context after optional delta
+    # filtering; unrestricted retrieval does not need an earlier serialization.
+    if view != "compact" or not unlimited:
+        measure(out)
+    return out
+
+
+def main(argv=None, *, include_methods=False):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", required=True, type=Path)
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--query", default="")
+    parser.add_argument("--anchor", action="append", default=[])
+    parser.add_argument("--budget-chars", type=int, help="可选 JSON 字符预算；默认不限制")
+    parser.add_argument("--max-candidates", type=int, help="可选材料候选数；默认不限制")
+    parser.add_argument("--cross-limit", type=int, default=0, help="启用观察两两对照并指定结果数；默认关闭")
+    parser.add_argument("--method-id", action="append", default=[])
+    parser.add_argument("--method-intent", action="append", default=[])
+    parser.add_argument("--no-methods", action="store_true")
+    parser.add_argument("--view", choices=("compact", "evidence"), default="compact")
+    parser.add_argument("--cursor", help="本会话读取游标；重复使用以仅返回变化")
+    parser.add_argument("--refresh", action="store_true", help="上下文压缩后重发当前查询完整视图")
+    args = parser.parse_args(argv)
+    if args.no_methods and (args.method_id or args.method_intent):
+        parser.error("--no-methods cannot be combined with --method-id or --method-intent")
+    try:
+        result = retrieve(args.root, args.run_id, args.query, args.anchor, args.budget_chars, args.max_candidates,
+                          include_methods=include_methods and not args.no_methods,
+                          method_ids=args.method_id, method_intents=args.method_intent, cross_limit=args.cross_limit,
+                          view=args.view, cursor=args.cursor, refresh=args.refresh)
+    except RetrievalError as exc:
+        print(encode({"error": str(exc)}), file=sys.stderr)
+        return 2
+    print(encode(result))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
