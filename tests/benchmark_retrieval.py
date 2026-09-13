@@ -80,7 +80,7 @@ def make_corpus(root, size, body_chars):
 
 
 def measured(root, **options):
-    stats = {}
+    stats, metrics = {}, {}
     original = retrieval_index.lexical_projection
 
     def traced(corpus, *args, **kwargs):
@@ -90,9 +90,9 @@ def measured(root, **options):
 
     with patch.object(retrieval_index, "lexical_projection", traced):
         started = perf_counter()
-        result = retrieve(root, RUN_ID, QUERY, [CONSUMER], **options)
+        result = retrieve(root, RUN_ID, QUERY, [CONSUMER], metrics=metrics, **options)
         seconds = perf_counter() - started
-    return result, {"seconds": seconds, "characters": len(encode(result)), "index": stats}
+    return result, {"seconds": seconds, "characters": len(encode(result)), "index": stats, "metrics": metrics}
 
 
 def check_context(result):
@@ -125,6 +125,8 @@ def benchmark(size, repeats, body_chars):
     with tempfile.TemporaryDirectory(prefix="webounty-retrieval-bench-") as directory:
         root = Path(directory)
         publication_seconds = make_corpus(root, size, body_chars)
+        # Publication builds the index now; explicitly remove it for a cold query.
+        shutil.rmtree(root / "cache")
         evidence, cold_evidence = measured(root, view="evidence")
         check_context(evidence)
         warm_evidence = series(root, repeats, view="evidence")
@@ -184,7 +186,7 @@ def main():
     result = {
         "scenario": "One consumer query in a mostly unrelated session; producer and counterevidence in other Wiki branches.",
         "measurement": "Synthetic Python/local-filesystem microbenchmark; no model or network calls. Characters are Unicode JSON characters, not tokens.",
-        "cold_definition": "Derived SQLite index absent; operating-system file cache is not flushed.",
+        "cold_definition": "Derived lexical and metadata caches absent; operating-system file cache is not flushed.",
         "query_timing": "time.perf_counter includes retrieval, source validation, view construction and cursor persistence; excludes final JSON serialization.",
         "limitations": "Same-process warm runs and repetitive synthetic response bodies; no claim about Claude end-to-end latency, real token savings or arbitrary corpora.",
         "measurements": [benchmark(size, args.repeats, args.body_chars) for size in args.sizes],

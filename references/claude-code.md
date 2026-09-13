@@ -28,10 +28,10 @@
 | 命令 | 用途 |
 |---|---|
 | start | 创建或复用会话 |
-| record | 提交观察、记录和 Wiki，并返回相关连接 |
+| record | 提交观察、记录和 Wiki，同步词法索引并返回相关连接与待复核判断 |
 | context | 默认返回紧凑知识与来源引用；--cursor 跨轮差量，--refresh 恢复当前视图 |
 | discover | 全会话能力供需检索、候选路径、多输入组合与表达复核 |
-| read | 按 ID 读取记录、页面、观察或工件及必要来源 |
+| read | 按 ID 读取资料；工件可用 --offset / --length 精读原文字节范围 |
 | compare | 并列比较两份已存观察的条件、响应和业务字段 |
 | methods | 读取固定方法，不创建会话 |
 | audit | 检查存储和引用 |
@@ -52,9 +52,11 @@ python3 -m unittest discover -s tests -p 'test_*.py' -v
 
 固定检索案例可另运行 `python3 -B tests/evaluate_retrieval.py`。它报告 MRR、Recall@5 及词法检索耗时；统计对象是标注的记录/观察，完整上下文与 Wiki 来源闭包另由工作流测试覆盖。日常 context 耗时写入本会话 `logs/operations.jsonl` 的 elapsed_ms，不记原始查询内容。
 
-record/context/discover/read 等命令的本地日志还记录 metrics.stages_ms 与 counts：状态读取、索引、来源验证、候选发现、装包、视图处理、变化影响及发布检查分别计时；CLI 的 response 日志补充最终序列化与实际输出字符数。计时不进入给模型的 JSON。阶段是包含子阶段的耗时，不能相加当总耗时。files_read、snapshot_files_read 分别统计 Corpus 初读与一致性复读；publish_evidence_files_read 统计发布中实际读取的不同证据文件，排除内存里的待写材料。
+record/context/discover/read 等命令的本地日志还记录 metrics.stages_ms 与 counts：状态读取、索引、来源验证、候选发现、装包、视图处理、变化影响及发布检查分别计时；CLI 的 response 日志补充最终序列化与实际输出字符数。阶段是包含子阶段的耗时，不能相加当总耗时。files_read 统计 Corpus 的内容读取，snapshot_files_checked 统计一致性文件指纹检查，range_bytes_read 统计范围读取字节；publish_evidence_files_read 统计发布验证读取的不同会话内证据文件，排除待写材料，后续索引读取另计。record 返回的 retrieval_index 包含更新数，不把本机耗时写入模型的检索正文。
 
-`python3 -B tests/benchmark_retrieval.py --sizes 100 300` 检查冷/热查询、单条更新、父目录改名、紧凑输出和游标恢复；报告本地耗时、索引更新数和 JSON 字符量，不把字符当作 Claude token。
+`python3 -B tests/benchmark_retrieval.py --sizes 100 1000` 检查冷/热查询、单条更新、父目录改名、紧凑输出和游标恢复；报告本地耗时、索引更新数、按需元数据读取数、关系查表次数和 JSON 字符量，不把字符当作 Claude token。热查询复用 SQLite 元数据与关系索引；冷查询删除缓存后重建。Python 文件读取计数不包含 SQLite 内部 I/O，不代表物理磁盘读取量。
+
+`python3 -B tests/benchmark_large_corpus.py --mib 128` 另测大型 UTF-8 原件的流式导入、尾部召回、范围读取、增量更新、缓存重建和篡改识别，报告本机耗时与 Linux 进程峰值内存。输入为含重复段落的合成文本，不是任意文件性能保证。
 
 `python3 -B tests/replay_session.py` 执行固定六轮回放，覆盖问句改写、新能力补齐前提、无关修改、目录改名、反证和压缩后恢复。它核对读取者已获资料加本轮增量是否覆盖人工标签中的必要引用、反证、候选与缺口，记录实际发起的原件补读；`--scripts-dir` 可指向旧版脚本做同案例对照。输出包含分阶段计时、读取与索引计数、额外返回比例和字符量。host_tokens 为 null：离线回放不测 Claude 理解、真实攻击实验或实际 token 消耗；新增影响解释可能增加变更轮输出。
 

@@ -51,7 +51,9 @@ class PageChecks:
     def _read_file_state(self, relative, *, written=False):
         proposed = getattr(self.corpus, "proposed_files", {})
         if not written and relative in proposed:
-            return ["proposed", digest(proposed[relative])]
+            from evidence_io import FileCopy
+            value = proposed[relative]
+            return ["proposed", value.metadata["sha256"] if isinstance(value, FileCopy) else digest(value)]
         path = self.corpus.path(relative)
         try:
             stat = path.stat()

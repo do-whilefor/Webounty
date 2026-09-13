@@ -7,6 +7,8 @@ description: "在 Claude Code 的同一研究会话内维护项目内 Wiki 和�
 
 围绕当前目标工作：读取本会话知识 → 找到缺口 → 取得新观察 → 写入 Wiki → 检索可连接的能力 → 验证连接。宿主 Claude 负责推理和使用现有工具执行，附带脚本负责存储、检索与条件检查。
 
+检索只使用本地词法、别名和结构化关系，不接入独立 LLM、Embedding API 或向量服务。
+
 Wiki 保存本轮对目标的理解；原始资料保存实际观察。一个会话包含多个问题、发现和实验。完成一个子问题、回复一次、等待或上下文压缩，都不清理 Wiki。
 
 ## 开始与继续
@@ -32,9 +34,29 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/session.py" context \
   --query '当前问题、目标对象和缺少的条件' --anchor '已知记录或页面ID' --cursor 'main'
 ```
 
+按当前任务选入口，不从自然语言关键词强行推断模式：
+
+| 当前需要 | 入口 |
+| --- | --- |
+| 已知 ID，读取原件或判断 | `read --id ID` |
+| 查事实、接口、原始响应 | `context --mode lexical --query '问题'` |
+| 判断某个问题还缺什么依据或前提 | `context --question-ref ID --cursor main` |
+| 找能力消费者、提供者或重看阻塞点 | `discover --anchor ID` 或 `--changed ID` |
+| 比较两份已有观察 | `compare --left ID --right ID` |
+
+`context` 默认仍为 `--mode combined`，词法模式仅跳过能力图发现，继续补齐来源和显式反证。`--question-ref` 指向本会话已有的 Question、Goal、Step 或其他问题记录，自动作为 anchor；记录未声明 needs 时不能推断前提齐全。具体输出和补检索例子见 [问题级检索](references/question-retrieval.md)。
+
 没有已知 ID 时省略 anchor。默认返回紧凑知识：目标、判断、条件、反证、缺口和来源引用；原始观察用 `read --id` 展开，完整证据包可用 `--view evidence`。ready 表示资料可读取，检索分数表示相关程度，都不是漏洞成立证明。
 
+大型原件通过 observation 的 `source_path` 导入，content 保留实际观察的上下文字段。UTF-8 原文参与检索；命中的 observation 可带 `source_match`，按其 artifact_id、offset、length 用 `read --id ID --offset N --length N` 读取对应原件片段。它只定位一个相关窗口，不是完整结论或新证据；必要时继续读取相邻内容，不能遗漏条件或反证。
+
 同一上下文沿用 cursor，先读变化项、gaps 和 chain_discovery；combination_changes 指出具体组合哪些输入发生变化，retired_refs 表示本次重查后不再适用的旧派生提示。unchanged_refs 只表示该游标曾返回相同资料，不表示重新验证或无需阅读。上下文压缩、丢失前文或更换执行者后，加 `--refresh` 重发当前问题的完整视图。首次使用或省略 cursor 会返回完整视图。先处理来源变更、反证和待复核项。
+
+removed_refs 表示当前完整清单确认某个已交付 Wiki 块被移除，应撤下其旧视图；换查询没有命中不算删除。
+
+先检查 `question_context` 的来源、反证与前提缺口，再读取关键原件。`answer_support: not_assessed` 表示脚本没有判断证据是否回答了问题；`candidate_complete` 仍须核对实际消费和共同条件。没有问题记录时，Claude 自行明确当前问题及证据缺口，不为一次简单查询强制建记录。
+
+只针对尚未解决的具体缺口补检索。`retrieval_progress.recommendation: stop_repeating_query` 表示同一 cursor 曾收到相同请求和当前资料，不代表已经回答或资料不存在；停止原样重复，改为精读、改写缺口查询，或在现有材料无法补齐时取得新观察。证据已经足够时直接回答；缺的是实验结果时停止搜索现有 Wiki。不要把简单重试或循环次数当作证据充分标准。
 
 查询应说明谁能提供缺失输入、谁消费新产物、正常基线在哪里、哪项反证可能改变判断；不要只搜索漏洞名称。见 [检索与链路组合](references/retrieval.md)。
 
@@ -49,6 +71,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/session.py" record \
   --root '本轮root' --run-id '本轮run_id' --input '本轮batch.json'
 ```
 
+- 整理 Wiki 时让 summary 说明对象、身份和实际观察；questions 保存它能帮助调查的问题，keywords/aliases 只补已理解的业务词或同义表达。问句不是肯定结论，不自动把词面相似能力合并。
 - 按实体、业务流程、能力、研究问题和候选链拆页；用 parent_page_id 表达目录关系，按需保存真实问题到 questions 字段。一个语义块保留完整结论、条件、反证和缺口。轮次只说明来源，不为每条消息建页。
 - 同一知识对象保持稳定 ID；更新记录时说明更正原因，关联支持与反证。原始观察另存新 ID。
 - 能力写清 capability.provides、capability.needs、控制范围和条件。正常业务步骤也可提供能力，不仅保存高分漏洞。
@@ -57,6 +80,12 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/session.py" record \
 - 同一研究会话只由一个执行者提交。处理当前研究的 Agent 可直接调用 record，无需为本地提交额外确认；同会话的并行子任务把结果交给该执行者。
 
 读取 record 返回的新关系与 change_impact：按其中的引用和原因检查受影响判断、页面、链及旧阻塞点。它是待复核入口，不能自动升级结论。带 cursor 的 context 也会提示本次新增或变化内容的影响；其中“新增”可能只是这个读取者首次收到。不要写完 Wiki 就停止利用它。
+
+record 正常返回时，本次词法索引已经更新。判断或目录变更只更新相关条目；原件未变时复用其词项。继续通过 record 修订 Wiki，不把直接编辑 Markdown 当作已完成来源同步。
+
+查询复用本会话的条目元数据和供需关系索引，按 ID 读取所需判断及来源。缓存缺失或状态文件被外部修改时从当前资料重建，仍校验命中的页面与原件。已知 ID 时直接 read；要补齐其关系时可用空 query 配合 anchor，避免无关词法查询。
+
+needs_review_record_ids 列出来源变化后待复核的能力、发现与链；它们保留历史依据，当前可用性须重新判断。确认新依据后显式修订，不把重建索引当作复核完成。
 
 ## 在新能力与阻塞点检查组合
 

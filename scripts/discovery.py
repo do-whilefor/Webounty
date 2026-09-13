@@ -66,7 +66,10 @@ class _Sources:
         self.corpus = corpus
         self.cache = {}
         self.reverse = defaultdict(set)
-        for rid, row in corpus.records.items():
+        metadata = getattr(corpus.records, "relations", None)
+        if metadata is not None:
+            self.reverse = metadata.links("contradiction")
+        for rid, row in (() if metadata is not None else corpus.records.items()):
             # "new contradicts old" invalidates its target. Conversely,
             # "old corrected_by/superseded_by new" invalidates its owner;
             # those outward references are handled in inspect(), not reversed.
@@ -143,12 +146,14 @@ def _constraint_check(provide, need):
 
 def _seeds(corpus, query, anchors, changed):
     records = corpus.records
+    metadata = getattr(records, "relations", None)
     seeds = set()
     requested = set(anchors) | set(changed)
     for ref in requested:
         if ref in records:
             seeds.add(ref)
-        for page in getattr(corpus, "pages", {}).values():
+        page = getattr(corpus, "pages", {}).get(ref)
+        for page in ([page] if page else []):
             if ref == page.get("page_id"):
                 seeds.update(_refs(page.get("source_refs", [])))
                 for block in page.get("blocks", []):
@@ -156,27 +161,37 @@ def _seeds(corpus, query, anchors, changed):
         block = getattr(corpus, "blocks", {}).get(ref)
         if block:
             seeds.update(_refs(block.get("source_refs", [])))
-        for rid, row in records.items():
-            if ref in row.get("subject_refs", []) or ref in _refs(row.get("observation_refs", [])):
-                seeds.add(rid)
+        if metadata is not None:
+            seeds.update(metadata.links("record_anchor")[ref])
+        else:
+            for rid, row in records.items():
+                if ref in row.get("subject_refs", []) or ref in _refs(row.get("observation_refs", [])):
+                    seeds.add(rid)
     if query.strip():
         terms = set(_terms(query))
-        for rid, row in records.items():
+        if metadata is not None:
+            seeds.update(metadata.union("seed_term", terms))
+        for rid, row in (() if metadata is not None else records.items()):
             authored = json.dumps({key: row.get(key) for key in
                                   ("id", "summary", "title", "capability", "subject_refs")}, ensure_ascii=False)
             if terms.intersection(_terms(authored)):
                 seeds.add(rid)
-        for block in getattr(corpus, "blocks", {}).values():
+        blocks = getattr(corpus, "blocks", {})
+        block_rows = blocks.loaded.values() if metadata is not None else blocks.values()
+        for block in block_rows:
             if terms.intersection(_terms(block.get("text", ""))):
                 seeds.update(_refs(block.get("source_refs", [])))
     # A current blocked step is an appropriate default focus even when the user
     # has not supplied the words describing its missing prerequisite.
     if not seeds and not requested:
-        seeds.update(rid for rid, row in records.items()
-                     if row.get("capability", {}).get("needs") and row.get("status") in {"active", "blocked"})
+        if metadata is not None:
+            seeds.update(metadata.links("flag")["default_seeds"])
+        else:
+            seeds.update(rid for rid, row in records.items()
+                         if row.get("capability", {}).get("needs") and row.get("status") in {"active", "blocked"})
     # Goal/Chain anchors can refer to their component records without capability.
-    reverse_sources = defaultdict(set)
-    for rid, row in records.items():
+    reverse_sources = metadata.links("reverse_support") if metadata is not None else defaultdict(set)
+    for rid, row in (() if metadata is not None else records.items()):
         for ref in _refs(_support_refs(row)):
             reverse_sources[ref].add(rid)
     pending = list(seeds)
@@ -193,7 +208,7 @@ def _seeds(corpus, query, anchors, changed):
             if linked in records and linked not in seeds:
                 seeds.add(linked)
                 pending.append(linked)
-    return seeds.intersection(records)
+    return {rid for rid in seeds if rid in records}
 
 
 def _matching_edges(records, seeds, focused, sources, review_seeds=()):
@@ -208,7 +223,12 @@ def _matching_edges(records, seeds, focused, sources, review_seeds=()):
     provided, needed = defaultdict(set), defaultdict(set)
     provides, needs = {}, {}
     record_provides, record_needs = defaultdict(list), defaultdict(list)
-    for rid, row in records.items():
+    metadata = getattr(records, "relations", None)
+    if metadata is not None:
+        provided, needed = metadata.links("named_provides"), metadata.links("named_needs")
+        provides, needs = metadata.links("provides"), metadata.links("needs")
+        record_provides, record_needs = metadata.links("record_provides"), metadata.links("record_needs")
+    for rid, row in (() if metadata is not None else records.items()):
         for field, names_by_spec, by_name, by_record in (
             ("provides", provides, provided, record_provides),
             ("needs", needs, needed, record_needs),

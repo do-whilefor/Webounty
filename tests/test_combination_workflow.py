@@ -130,6 +130,7 @@ class CombinationWorkflowTests(unittest.TestCase):
         replacement = spec("short-lived-pass")
         replacement["description"] = "May represent a download grant; verify actual consumption"
         self.publish([capability("D", [replacement])])
+        before_query = (self.root / "state.json").read_bytes()
         result = self.query()
         review = result["chain_discovery"]["type_reviews"][0]
         self.assertEqual(review["reason"], "all_complete_matches_unusable_review_alternatives")
@@ -137,7 +138,8 @@ class CombinationWorkflowTests(unittest.TestCase):
         self.assertFalse(review["evidence"])
         self.assertFalse(any(row["producer_ref"] == "D" for row in result["chain_discovery"]["candidates"]))
         self.assertNotIn("D", {row["id"] for row in result["records"]})
-        self.assertEqual(json.loads((self.root / "state.json").read_text())["records"]["B"]["status"], "observed")
+        self.assertEqual(json.loads(before_query)["records"]["B"]["status"], "needs_review")
+        self.assertEqual((self.root / "state.json").read_bytes(), before_query)
 
     def test_removing_a_required_input_retires_only_the_old_combination(self):
         self.initial()

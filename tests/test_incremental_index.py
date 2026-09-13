@@ -105,12 +105,13 @@ class IncrementalIndexTests(unittest.TestCase):
         self.publish_pages()
         rank(self.corpus(), "租户隔离", [])
         previous = (self.root / "wiki/pages/C.md").read_bytes()
-        publish(self.root, "R1", {"pages": [{"id": "P", "title": "下载授权"}]})
+        publication = publish(self.root, "R1", {"pages": [{"id": "P", "title": "下载授权"}]})
         changed = self.corpus()
         self.assertIn(("block", "C/B"), rank(changed, "下载授权", [])[0])
         self.assertNotIn(("block", "C/B"), rank(self.corpus(), "租户隔离", [])[0])
         self.assertEqual((self.root / "wiki/pages/C.md").read_bytes(), previous)
-        self.assertEqual(changed.retrieval_index_stats["indexed_documents"], 1)
+        self.assertEqual(publication["retrieval_index"]["indexed_documents"], 1)
+        self.assertEqual(changed.retrieval_index_stats["indexed_documents"], 0)
 
     def test_tampered_wiki_drops_cached_lexical_hit_but_keeps_exact_diagnostic(self):
         self.publish_pages()

@@ -265,9 +265,8 @@ def finalize_context(corpus, result, *, view="compact", cursor=None, refresh=Fal
         raise ValueError("cursor must be a nonempty name")
     if refresh and cursor is None:
         raise ValueError("refresh requires a cursor")
-    if view == "evidence" and cursor is None:
-        return result
-    out = (_compact(corpus, result) if view == "compact" and result.get("view") != "compact"
+    out = (result if view == "evidence" and cursor is None else
+           _compact(corpus, result) if view == "compact" and result.get("view") != "compact"
            else {**result, "budget": dict(result["budget"]), "view": view})
     cursor_path, saved = None, None
     if cursor is not None:
@@ -275,8 +274,10 @@ def finalize_context(corpus, result, *, view="compact", cursor=None, refresh=Fal
         cursor_path = Path(corpus.root) / "cache" / ("context-" + _hash({**scope, "cursor": cursor}) + ".json")
         previous = json.loads(cursor_path.read_text(encoding="utf-8")) if cursor_path.exists() else None
         delivered = {} if refresh or previous is None else dict(previous["delivered"])
-        saved = {**scope, "delivered": dict(delivered)}
+        queries = {} if refresh or previous is None else dict(previous.get("queries", {}))
+        saved = {**scope, "delivered": dict(delivered), "queries": queries}
         source_view = _compact(corpus, result) if view == "evidence" else out
+        query_units = {}
         source_signature = _source_signatures(corpus, source_view)
         block_dependencies = _block_dependency_signatures(source_view, source_signature)
         delta = {"cursor": cursor, "refresh": refresh, "scope": "current_result_only", "changes": [],
@@ -299,6 +300,7 @@ def finalize_context(corpus, result, *, view="compact", cursor=None, refresh=Fal
                 current["review_consumer"] = row["consumer_ref"]
             old = delivered.get(key)
             saved["delivered"][key] = current
+            query_units[key] = current
             ref = {"kind": kind, "id": rid}
             if current == old:
                 unchanged.append(ref)
@@ -323,6 +325,35 @@ def finalize_context(corpus, result, *, view="compact", cursor=None, refresh=Fal
         for group in _DISCOVERY_GROUPS:
             out["chain_discovery"][group] = [row for row in out["chain_discovery"].get(group, [])
                                               if changed("chain_discovery." + group, row)]
+        request = result.get("retrieval_request")
+        if request is not None:
+            request_key = _hash({**request, "budget_chars": result["budget"].get("limit_chars")})
+            # Reuse per-unit signatures already computed for delta delivery;
+            # do not serialize all compact bodies again to detect repeats.
+            current_result = _hash({"state_revision": result["state_revision"], "units": query_units,
+                "question_context": result.get("question_context"), "gaps": result.get("gaps", []),
+                "discovery_issues": result.get("chain_discovery", {}).get("issues", [])})
+            complete = _can_advance(result) and not result["budget"].get("omitted_units", 0)
+            repeated = complete and queries.get(request_key) == current_result
+            out["retrieval_progress"] = {
+                "same_request_unchanged": repeated, "evidence": False,
+                "recommendation": ("stop_repeating_query" if repeated else
+                                   "inspect_material" if complete else "resolve_incomplete_retrieval"),
+                "basis": "same_request_and_current_result_since_cursor_delivery",
+                "answer_support": "not_assessed"}
+            if complete:
+                saved["queries"][request_key] = current_result
+
+        # A removed Wiki block is known from the complete current manifest,
+        # independently of this query's matches. Never infer removal from an
+        # unreadable manifest or simply from a different query result.
+        if _can_advance(result) and not getattr(corpus, "load_issues", []):
+            for key in delivered:
+                kind, rid = json.loads(key)
+                if kind == "block" and rid not in corpus.blocks:
+                    delta.setdefault("removed_refs", []).append({"kind": kind, "id": rid,
+                        "reason": "removed_from_current_manifest", "evidence": False})
+                    saved["delivered"].pop(key, None)
         # Only retire a derived view when its consumer was actually revisited.
         # Absence from a different query still says nothing about deletion.
         revisited = set(result.get("chain_discovery", {}).get("record_refs", []))
@@ -345,7 +376,9 @@ def finalize_context(corpus, result, *, view="compact", cursor=None, refresh=Fal
         # Previously delivered content and newly encountered evidence can change
         # the current research direction. This describes the reader's knowledge,
         # not a claim that every newly encountered record was just created.
-        if (previous is not None and not refresh and result.get("status") != "unavailable"
+        if (previous is not None and not refresh
+                and result.get("retrieval_request", {}).get("mode") != "lexical"
+                and result.get("status") != "unavailable"
                 and not any(row.get("code") == "snapshot_changed" for row in result.get("gaps", []))):
             changed_refs = [row["id"] for group in ("records", "observations", "entities", "artifacts")
                             for row in out.get(group, [])]
@@ -365,7 +398,7 @@ def finalize_context(corpus, result, *, view="compact", cursor=None, refresh=Fal
         discarded = sum(len(out.get(group, [])) for group in (*_GROUPS, "unchanged_refs"))
         discarded += sum(len(out.get("chain_discovery", {}).get(group, [])) for group in _DISCOVERY_GROUPS)
         discarded += sum(len(out.get("delta", {}).get(group, []))
-                         for group in ("metadata_changes", "combination_changes", "retired_refs"))
+                         for group in ("metadata_changes", "combination_changes", "retired_refs", "removed_refs"))
         discarded += sum(len(value) for key, value in out.get("change_impact", {}).items()
                          if isinstance(value, list) and key != "changed_refs")
         out = {"run_id": corpus.run_id, "state_revision": corpus.state["revision"], "status": "unavailable",

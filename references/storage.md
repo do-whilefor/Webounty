@@ -13,6 +13,8 @@
 | wiki/manifest.json | 稳定页面/块定位、父页面 ID、哈希、来源修订、检索字段及可选知识注释 |
 | wiki/index.md | 派生导航 |
 | cache/page-checks.json | 可重建的首页检查缓存；不作为来源，不替代读取和审计 |
+| cache/retrieval.sqlite | 词项、原件窗口、文档依赖与索引修订；提交完成时同步，可删除重建 |
+| cache/metadata.sqlite | 按 ID 读取的派生元数据、供需与反向关系索引；提交时更新变化对象，可删除重建 |
 | logs/ | 操作记录，不复制凭据或完整流量 |
 
 一个会话一份工作区，多轮对话持续更新；ID 不含实际凭据。记录是真实状态，页面是有来源的解释，检索结果是读取视图。不要手工改哈希或清单，也不要把 Wiki 当作新的原始证据。
@@ -43,7 +45,7 @@ record --input 接收 UTF-8 JSON 文件，或 `--input -` 从 stdin 读取。顶
 
 content 可保存 HTTP、日志、源码定位、用户输入等 JSON 对象，字段来自真实资料；上例为虚构格式。主体 ID 必须先登记或在同批 entities 中登记。没有主体时使用空数组，不编造。
 
-source_path 可填写实际输入文件的绝对路径，脚本复制原件并登记来源；原路径不会删除。观察存为单独 JSONL，不允许重复覆盖 ID。证据更正用新观察和对应记录的更正关联表达。
+source_path 可填写实际输入文件的绝对路径，脚本流式复制原件、计算哈希并登记来源；原路径不会删除。UTF-8 文本原件分段参与全文检索，二进制原件仅保存与验证。大响应、日志或源码文件优先从 source_path 导入，content 只写实际取得的请求、响应状态、环境等上下文字段；不要为缩短正文而编造摘要或条件。观察存为单独 JSONL，不允许重复覆盖 ID。证据更正用新观察和对应记录的更正关联表达。
 
 ### 实体
 
@@ -70,7 +72,7 @@ capability.provides / capability.needs 是能力供需，不要混用记录级 r
 
 修订时自动保存简短 history 条目，用于说明旧判断为何变化；其 record_refs / observation_refs 是历史定位，不加入当前必需证据。首页分区、发现详情、负结果和修订区的写法见 [Wiki 组织](wiki-layout.md)。
 
-新反证可单独建记录并设 contradicts:[旧记录ID]。旧记录需要被修正时同时更新其 status 和关联；不要删除旧原件。依赖变化会让相关 Chain 转为 needs_review，页面会返回来源变化提示，Claude 应复核后重新发布。
+新反证可单独建记录并设 contradicts:[旧记录ID]。旧记录需要被修正时同时更新其 status 和关联；不要删除旧原件。来源、主体条件或反证变化会沿依赖反查传播，未在本批显式复核的 Capability、Finding、Chain 转为 needs_review。record 用 needs_review_record_ids 返回这些判断，并保留 needs_review_chain_ids。原始观察和历史 Fact 不因此被否定；页面提示待复核，Claude 读取证据后显式修订判断。
 
 曾取得的能力后来撤销或过期时，保留历史取得观察，新增当前失效观察，并修订该能力的当前可用性。摘要与 change_reason 说明反证针对的是“现在仍可使用”，不否定过去确实取得；尚未确认失效时保留待复核状态。
 
@@ -112,7 +114,7 @@ capability.provides / capability.needs 是能力供需，不要混用记录级 r
 }
 ```
 
-已有页面只提交 `id` 加标题、父 ID、kind 或上述检索字段时，执行元数据更新：保留原块、稳定锚点、来源修订和已审阅集合。标题改变只更新页首；移动目录不改正文。祖先标题路径由当前父子关系派生，不在每个后代中存副本；索引根据变化路径更新受影响条目。改名或移动不代表已复核旧解释，待复核状态不会因此消失。
+已有页面只提交 `id` 加标题、父 ID、kind 或上述检索字段时，执行元数据更新：保留原块、稳定锚点、来源修订和已审阅集合。标题改变只更新页首；移动目录不改正文。祖先标题路径由当前父子关系派生，仅在可重建检索缓存中保存投影；索引根据变化路径更新受影响条目。改名或移动不代表已复核旧解释，待复核状态不会因此消失。
 
 提交 `blocks` 或 `record_refs` 时仍是完整页面编辑，应提供完整的新解释及实际来源；需要保留的父关系与检索字段也一并传入。自动从记录生成的块由脚本标为 `representation: record`，使紧凑读取能避免重复返回同一记录正文；作者块不能自行声明这个标记。
 
@@ -153,7 +155,10 @@ provide_index 和 need_index 从 0 开始。连接 assessment 为 candidate/veri
 
 ```bash
 python3 scripts/session.py read --root '本轮root' --run-id '本轮run_id' --id C-001 --id WK-FLOW
+python3 scripts/session.py read --root '本轮root' --run-id '本轮run_id' --id SRC-O-001 --offset 0 --length 65536
 python3 scripts/session.py audit --root '本轮root' --run-id '本轮run_id'
 ```
 
 数据不正确时先修正当前 batch，命令失败后不要重放外部取证动作。一次提交在写入前检查结构和来源，但不是多文件事务或崩溃恢复系统；当前 MVP 要求单写者。
+
+record 正常返回意味着本次状态、Wiki 与词法索引均已更新。retrieval_index 区分本次重建、重用、删除、签名检查和原件分段数。异常中断后，查询按状态文件与索引的修订/指纹差异重新核对缓存；这不为多文件提交提供回滚或原子性保证。

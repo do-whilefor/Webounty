@@ -233,8 +233,10 @@ def _plan(records, by_need, all_edges, root, ranks):
     return plan, referenced
 
 
-def build_combinations(records, candidates, consumer_refs):
+def build_combinations(records, candidates, consumer_refs, *, minimum_inputs=2):
     """Build one AND group per relevant consumer with at least two inputs.
+
+    Question-scoped checks may explicitly include single-input consumers.
 
     Input coverage is local: candidate_ready means a compatible, usable OR
     branch has all its recursive inputs. Only plan.coverage additionally checks
@@ -242,16 +244,21 @@ def build_combinations(records, candidates, consumer_refs):
     value is evidence, and unresolved representative plans do not rule out other
     combinations of the preserved alternatives.
     """
+    consumers = sorted(rid for rid in set(consumer_refs) if rid in records and len(_needs(records, rid)) >= minimum_inputs)
+    if not consumers:
+        return []
     candidates = sorted(candidates, key=_key)
     by_need = defaultdict(list)
     for edge in candidates:
         by_need[(edge["consumer_ref"], edge["need_index"])].append(edge)
-    ranks = _grounded(records, candidates)
+    # A record outside the candidate endpoints cannot contribute a binding to
+    # this graph. Include every endpoint and consumer, without loading unrelated
+    # session records just to assign unused startup ranks.
+    graph_refs = set(consumers) | {edge[role + "_ref"] for edge in candidates for role in ("producer", "consumer")}
+    ranks = _grounded(records, candidates, graph_refs)
     result = []
-    for consumer in sorted(set(consumer_refs).intersection(records)):
+    for consumer in consumers:
         needs = _needs(records, consumer)
-        if len(needs) < 2:
-            continue
         inputs = []
         for index, need in enumerate(needs):
             options = by_need.get((consumer, index), ())

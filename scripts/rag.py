@@ -4,10 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import base64
+from collections import OrderedDict, defaultdict
 from functools import wraps
 import hashlib
 import heapq
 import json
+import os
 from pathlib import Path
 import re
 import sys
@@ -19,6 +22,7 @@ from search_index import rank as rank_corpus
 from telemetry import count, measure as stage_measure
 from context_views import (compact_artifact, compact_block, compact_mandatory,
                            compact_navigation, compact_observation, compact_record)
+from evidence_io import fingerprint, scan, text_chunks
 
 
 def corpus_stage(name):
@@ -98,26 +102,43 @@ def text_values(value):
 
 
 class Corpus:
-    # Read-time caps prevent a malformed local corpus from causing unbounded expansion.
-    MAX_FILE_BYTES = 16 * 1024 * 1024
-    MAX_ITEMS = 12000
-    MAX_TOTAL_BYTES = 64 * 1024 * 1024
+    # Retain only small byte buffers. These are cache sizes, not input limits.
+    CACHE_FILE_BYTES = 256 * 1024
+    CACHE_TOTAL_BYTES = 2 * 1024 * 1024
 
     @corpus_stage("load")
-    def __init__(self, root, run_id, *, lazy_pages=False, metrics=None):
+    def __init__(self, root, run_id, *, lazy_pages=False, lazy_metadata=False, metrics=None):
         self.metrics = metrics
         self.root = Path(root).resolve(strict=True)
         if not self.root.is_dir() or not run_id:
             raise RetrievalError("root 必须是本轮资料目录，run_id 不可为空")
         self.run_id = run_id
+        self.path_cache = {}
+        self.metadata = None
         self.read_files = {}
+        self.byte_cache = OrderedDict()
+        self.cached_bytes = 0
+        self.file_checks = {}
         self.total_bytes = 0
-        self.state = self.read_json("state.json")
         self.load_issues = []
+        self.page_issues = defaultdict(list)
+        self.art_cache, self.obs_cache, self.check_cache, self.line_cache = {}, {}, {}, {}
+        self.closure_cache, self.knowledge_check_cache, self.reasoning_cache = {}, {}, {}
+        self.loaded_pages = set()
         # The nested layout is canonical; the root manifest supports early fixtures.
         self.manifest_path = "wiki/manifest.json"
         if not self.path(self.manifest_path).exists():
             self.manifest_path = "manifest.json"
+        if lazy_metadata:
+            from metadata_cache import open_current
+            cached = open_current(self)
+            if cached is not None:
+                cached.bind(self)
+                if not lazy_pages:
+                    for pid in self.pages:
+                        self.ensure_page(pid)
+                return
+        self.state = self.read_json("state.json")
         try:
             self.manifest = self.read_json(self.manifest_path)
         except (OSError, UnicodeError, json.JSONDecodeError):
@@ -131,20 +152,12 @@ class Corpus:
         self.artifacts = self.state["artifacts"]
         self.pages = {}
         self.blocks = {}
-        self.page_issues = {}
-        self.art_cache = {}
-        self.obs_cache = {}
-        self.check_cache = {}
-        self.line_cache = {}
-        self.closure_cache = {}
-        self.knowledge_check_cache = {}
-        self.reasoning_cache = {}
         self.subject_index = {}
         all_ids = set()
         for name, group in (("records", self.records), ("entities", self.entities),
                             ("observations", self.observations), ("artifacts", self.artifacts)):
-            if not isinstance(group, dict) or len(group) > self.MAX_ITEMS:
-                raise RetrievalError(f"{name} 不是有效的小型本轮索引")
+            if not isinstance(group, dict):
+                raise RetrievalError(f"{name} 不是有效的本轮索引")
             for key, value in group.items():
                 if value.get("id") != key or key in all_ids:
                     raise RetrievalError("索引 ID 重复或不匹配")
@@ -166,9 +179,6 @@ class Corpus:
                 if key in self.blocks:
                     raise RetrievalError("Wiki 块 ID 重复")
                 self.blocks[key] = {**block, "page_id": pid, "text": "", "_issues": []}
-        self.loaded_pages = set()
-        if len(self.blocks) + len(all_ids) > self.MAX_ITEMS:
-            raise RetrievalError("本轮索引超过原型扫描上限，需要缩小导入范围")
         self.record_dependencies = {rid: dependencies(row) for rid, row in self.records.items()}
         self.cycle_dependencies = dict(self.record_dependencies)
         for rid, row in self.records.items():
@@ -190,6 +200,12 @@ class Corpus:
         self.derived_paths.update(self.path(p) for p in (
             "state.json", "manifest.json", "wiki/manifest.json", "wiki-knowledge.json"))
         self.derived_hashes = {p["content_hash"] for p in self.pages.values()}
+        if lazy_metadata and not self.load_issues:
+            from metadata_cache import save, open_current
+            save(self)
+            cached = open_current(self)
+            if cached is not None:
+                cached.bind(self)
         if not lazy_pages:
             for pid in self.pages:
                 self.ensure_page(pid)
@@ -227,31 +243,87 @@ class Corpus:
         self.loaded_pages.add(pid)
 
     def path(self, relative):
-        p = Path(relative)
-        if p.is_absolute():
+        relative = os.fspath(relative)
+        if relative in self.path_cache:
+            count(self.metrics, "paths_reused")
+            return self.path_cache[relative]
+        if os.path.isabs(relative):
             raise RetrievalError("资料路径必须相对本轮 root")
-        resolved = (self.root / p).resolve()
-        if not resolved.is_relative_to(self.root):
+        resolved = os.path.realpath(os.path.join(self.root, relative))
+        if os.path.commonpath((self.root, resolved)) != str(self.root):
             raise RetrievalError("资料路径或符号链接越出本轮 root")
-        return resolved
+        self.path_cache[relative] = Path(resolved)
+        count(self.metrics, "paths_resolved")
+        return self.path_cache[relative]
+
+    def close(self):
+        if self.metadata is not None:
+            self.metadata.close()
+            self.metadata = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+    def records_with_flag(self, flag):
+        if self.metadata is not None:
+            return [self.records[rid] for rid in sorted(self.metadata.links("flag")[flag])]
+        kind, status = {"goals": ("Goal", "active"), "blockers": ("Step", "blocked")}[flag]
+        return [row for row in self.records.values() if row.get("kind") == kind and row.get("status") == status]
+
+    def source_blocks(self, refs):
+        refs = set(refs)
+        if self.metadata is not None:
+            return self.metadata.union("source_block", refs)
+        return {bid for bid, row in self.blocks.items() if refs.intersection(ref_ids(row.get("source_refs", [])))}
 
     def read_bytes(self, relative):
         p = self.path(relative)
-        if p in self.read_files:
-            return self.read_files[p]
-        if p.stat().st_size > self.MAX_FILE_BYTES:
-            raise RetrievalError("单个资料文件超过 16 MiB 原型上限")
+        if p in self.byte_cache:
+            self.byte_cache.move_to_end(p)
+            return self.byte_cache[p]
+        before = fingerprint(p)
         with p.open("rb") as stream:
-            data = stream.read(self.MAX_FILE_BYTES + 1)
-        if len(data) > self.MAX_FILE_BYTES:
-            raise RetrievalError("读取期间文件超过上限")
+            data = stream.read()
+        if before != fingerprint(p):
+            raise RetrievalError("资料在读取期间发生变化")
         self.total_bytes += len(data)
-        if self.total_bytes > self.MAX_TOTAL_BYTES:
-            raise RetrievalError("本次读取超过 64 MiB 原型上限")
-        self.read_files[p] = data
+        self.read_files.setdefault(p, before)
+        self.remember_bytes(p, data)
         count(self.metrics, "files_read")
         count(self.metrics, "bytes_read", len(data))
         return data
+
+    def remember_bytes(self, path, data):
+        if len(data) > self.CACHE_FILE_BYTES:
+            return
+        if path in self.byte_cache:
+            self.cached_bytes -= len(self.byte_cache.pop(path))
+        self.byte_cache[path] = data
+        self.cached_bytes += len(data)
+        while self.cached_bytes > self.CACHE_TOTAL_BYTES:
+            _, previous = self.byte_cache.popitem(last=False)
+            self.cached_bytes -= len(previous)
+
+    def source_path(self, relative):
+        return self.path(relative)
+
+    def file_size(self, relative):
+        return self.source_path(relative).stat().st_size
+
+    def inspect_file(self, relative):
+        """Hash selected originals incrementally; keep no full source byte copy."""
+        path = self.source_path(relative)
+        if path not in self.file_checks:
+            result = scan(path)
+            self.read_files.setdefault(path, result["fingerprint"])
+            self.file_checks[path] = result
+            self.total_bytes += result["bytes"]
+            count(self.metrics, "files_read")
+            count(self.metrics, "bytes_read", result["bytes"])
+        return self.file_checks[path]
 
     def read_json(self, relative):
         return json.loads(self.read_bytes(relative))
@@ -263,11 +335,8 @@ class Corpus:
             if path.resolve() != path or not path.resolve().is_relative_to(self.root):
                 return False
             try:
-                with path.open("rb") as stream:
-                    current = stream.read(len(previous) + 1)
-                count(self.metrics, "snapshot_files_read")
-                count(self.metrics, "snapshot_bytes_read", len(current))
-                if current != previous:
+                count(self.metrics, "snapshot_files_checked")
+                if fingerprint(path) != previous:
                     return False
             except OSError:
                 return False
@@ -287,11 +356,18 @@ class Corpus:
             if meta.get("kind") in {"wiki", "report", "derived", "method"}:
                 issues.append({"code": "derived_source", "artifact_id": aid})
             try:
-                data = self.read_bytes(meta["path"])
+                # Inline observation JSON is decoded only when needed. Large
+                # external originals are verified without materializing bytes.
+                if self.file_size(meta["path"]) <= self.CACHE_FILE_BYTES:
+                    data = self.read_bytes(meta["path"])
+                    checked_hash, checked_bytes = digest(data), len(data)
+                else:
+                    checked = self.inspect_file(meta["path"])
+                    checked_hash, checked_bytes = checked["sha256"], checked["bytes"]
                 count(self.metrics, "artifacts_verified")
-                if digest(data) != meta["sha256"] or len(data) != meta["bytes"]:
+                if checked_hash != meta["sha256"] or checked_bytes != meta["bytes"]:
                     issues.append({"code": "artifact_hash_mismatch", "artifact_id": aid})
-                if self.path(meta["path"]) in self.derived_paths or digest(data) in self.derived_hashes:
+                if self.path(meta["path"]) in self.derived_paths or checked_hash in self.derived_hashes:
                     issues.append({"code": "derived_source", "artifact_id": aid})
             except OSError:
                 issues.append({"code": "artifact_missing", "artifact_id": aid})
@@ -299,6 +375,51 @@ class Corpus:
                   "provenance": meta, "issues": issues, "data": data if not issues else None}
         self.art_cache[aid] = result
         return result
+
+    def artifact_data(self, aid):
+        artifact = self.artifact(aid)
+        if artifact["status"] != "ready":
+            return None
+        return artifact["data"] if artifact["data"] is not None else self.read_bytes(artifact["provenance"]["path"])
+
+    def artifact_window(self, aid, offset, length):
+        if offset < 0 or length <= 0:
+            raise ValueError("offset must be nonnegative and length must be positive")
+        artifact = self.artifact(aid)
+        row = {key: value for key, value in artifact.items() if key != "data"}
+        if artifact["status"] != "ready":
+            return row
+        if offset > artifact["provenance"]["bytes"]:
+            raise ValueError("offset is outside the artifact")
+        with self.source_path(artifact["provenance"]["path"]).open("rb") as stream:
+            stream.seek(offset)
+            data = stream.read(length)
+        count(self.metrics, "range_bytes_read", len(data))
+        row["range"] = {"offset": offset, "length": len(data), "sha256": digest(data),
+                        "total_bytes": artifact["provenance"]["bytes"],
+                        "next_offset": offset + len(data), "eof": offset + len(data) >= artifact["provenance"]["bytes"]}
+        try:
+            row.update(content=data.decode("utf-8"), encoding="utf-8")
+        except UnicodeError:
+            row.update(content=base64.b64encode(data).decode("ascii"), encoding="base64")
+        return row
+
+    def source_chunks(self, oid):
+        aid = self.observations[oid].get("source_artifact_id")
+        if not aid:
+            return
+        artifact = self.artifact(aid)
+        if artifact["status"] != "ready" or artifact["provenance"].get("text_encoding") != "utf-8":
+            return
+        for locator, text in text_chunks(self.source_path(artifact["provenance"]["path"])):
+            yield {"artifact_id": aid, **locator}, text
+
+    def release_observation(self, oid):
+        """Indexing one observation must not retain all previous raw payloads."""
+        self.obs_cache.pop(oid, None)
+        aid = self.observations[oid]["artifact_id"]
+        self.art_cache.pop(aid, None)
+        self.line_cache.pop(aid, None)
 
     def observation(self, oid):
         if oid in self.obs_cache:
@@ -308,8 +429,9 @@ class Corpus:
         issues, raw = list(artifact["issues"]), None
         if index.get("source_artifact_id"):
             issues.extend(self.artifact(index["source_artifact_id"])["issues"])
-        if artifact["data"] is not None:
-            lines = self.artifact_lines(index["artifact_id"], artifact["data"])
+        data = self.artifact_data(index["artifact_id"])
+        if data is not None:
+            lines = self.artifact_lines(index["artifact_id"], data)
             number = index.get("line", 0)
             if not isinstance(number, int) or not 1 <= number <= len(lines):
                 issues.append({"code": "observation_location_missing", "id": oid})
@@ -332,11 +454,16 @@ class Corpus:
                "provenance": {"artifact_id": index["artifact_id"],
                               "path": self.artifacts.get(index["artifact_id"], {}).get("path"),
                               "line": index.get("line"), "content_hash": index["content_hash"]},
-               "issues": issues}
-        self.obs_cache[oid] = out
+                "issues": issues}
+        if oid in getattr(self, "retrieval_source_matches", {}):
+            out["source_match"] = self.retrieval_source_matches[oid]
+        if self.artifacts.get(index["artifact_id"], {}).get("bytes", 0) <= self.CACHE_FILE_BYTES:
+            self.obs_cache[oid] = out
         return out
 
     def artifact_lines(self, aid, data):
+        if len(data) > self.CACHE_FILE_BYTES:
+            return data.splitlines(keepends=True)
         if aid not in self.line_cache:
             self.line_cache[aid] = data.splitlines(keepends=True)
         return self.line_cache[aid]
@@ -344,9 +471,19 @@ class Corpus:
     def artifact_reference_issues(self, ref):
         artifact = self.artifact(ref["artifact_id"])
         issues = list(artifact["issues"])
-        if "line" in ref and artifact["data"] is not None:
+        if "line" in ref and artifact["status"] == "ready":
             line = ref["line"]
-            if not isinstance(line, int) or isinstance(line, bool) or not 1 <= line <= len(self.artifact_lines(ref["artifact_id"], artifact["data"])):
+            found = False
+            if isinstance(line, int) and not isinstance(line, bool) and line >= 1:
+                data = artifact["data"]
+                if data is None and artifact["provenance"].get("kind") == "observation":
+                    data = self.artifact_data(ref["artifact_id"])
+                if data is not None:
+                    found = line <= len(self.artifact_lines(ref["artifact_id"], data))
+                else:
+                    with self.source_path(artifact["provenance"]["path"]).open("rb") as stream:
+                        found = any(number == line for number, _ in enumerate(stream, 1))
+            if not found:
                 issues.append({"code": "artifact_location_missing", "artifact_id": ref["artifact_id"], "line": line})
         return issues
 
@@ -407,9 +544,7 @@ class Corpus:
                 issues.extend(self.artifact_reference_issues(ref))
         conditions = page.get("conditions", {})
         subjects = set(page["discovery_scope"]["subject_refs"])
-        for goal in self.records.values():
-            if goal.get("kind") != "Goal" or goal.get("status") != "active":
-                continue
+        for goal in self.records_with_flag("goals"):
             if subjects.intersection(goal.get("subject_refs", [])):
                 current = goal.get("scope", {})
                 for axis in ("environment", "session_generation"):
@@ -583,11 +718,11 @@ class Corpus:
             issues.extend(artifact["issues"])
             artifacts.append(compact_artifact(artifact) if view == "compact"
                              else {k: v for k, v in artifact.items() if k != "data"})
-            if (view == "evidence" and _expand_artifacts and artifact["data"]
+            if (view == "evidence" and _expand_artifacts and artifact["status"] == "ready"
                     and not any(o["index"]["artifact_id"] == aid for o in observations)):
                 try:
                     count(self.metrics, "source_text_expansions")
-                    artifacts[-1]["content"] = artifact["data"].decode("utf-8")
+                    artifacts[-1]["content"] = self.artifact_data(aid).decode("utf-8")
                     count(self.metrics, "source_text_chars", len(artifacts[-1]["content"]))
                 except UnicodeError:
                     issues.append({"code": "non_text_artifact", "artifact_id": aid})
@@ -686,7 +821,13 @@ def cross_candidates(corpus, observations, limit):
 
 def retrieve(root, run_id, query, anchors=(), budget_chars=None, max_candidates=None,
              *, include_methods=False, method_ids=(), method_intents=(), cross_limit=0,
-             view="evidence", cursor=None, refresh=False, metrics=None):
+             view="evidence", cursor=None, refresh=False, metrics=None,
+             mode="combined", question_ref=None):
+    anchors = list(anchors)
+    if mode not in {"combined", "lexical"}:
+        raise RetrievalError("mode must be combined or lexical")
+    if question_ref:
+        anchors = list(dict.fromkeys([question_ref, *anchors]))
     if not isinstance(query, str) or (not query.strip() and not anchors):
         raise RetrievalError("query 或 anchor 至少提供一项")
     if budget_chars is not None and (isinstance(budget_chars, bool) or not isinstance(budget_chars, int) or budget_chars < 1024):
@@ -695,13 +836,27 @@ def retrieve(root, run_id, query, anchors=(), budget_chars=None, max_candidates=
         raise RetrievalError("max_candidates 必须为空或正整数")
     if isinstance(cross_limit, bool) or not isinstance(cross_limit, int) or cross_limit < 0:
         raise RetrievalError("cross_limit 必须为非负整数；0 表示不运行观察两两对照")
+    corpus = None
     try:
-        corpus = Corpus(root, run_id, lazy_pages=True, metrics=metrics)
+        corpus = Corpus(root, run_id, lazy_pages=True, lazy_metadata=True, metrics=metrics)
+        if question_ref is not None and question_ref not in corpus.records:
+            raise RetrievalError("question_ref must identify an existing session record")
         method_units, method_issues = (select_methods(query, method_ids, intents=method_intents)
                                       if include_methods or method_ids or method_intents else ([], []))
         result = _retrieve(corpus, query, list(anchors), budget_chars, max_candidates,
                            method_units, method_issues, cross_limit=cross_limit, related_only=view == "compact",
-                           view=view)
+                           view=view, mode=mode)
+        result["retrieval_request"] = {"mode": mode, "query": query, "anchors": sorted(set(anchors)),
+            "question_ref": question_ref, "max_candidates": max_candidates,
+            "cross_limit": cross_limit, "include_methods": include_methods,
+            "method_ids": sorted(method_ids), "method_intents": sorted(method_intents)}
+        if question_ref is not None:
+            from question_context import assess_question
+            result["question_context"] = assess_question(corpus, question_ref, result, mode=mode)
+            if not corpus.stable():
+                result = {"run_id": corpus.run_id, "state_revision": corpus.state["revision"],
+                    "status": "unavailable", "gaps": [{"code": "snapshot_changed"}],
+                    "budget": {"limit_chars": budget_chars, "used_chars": 0, "omitted_units": 0}}
         from context_views import finalize_context
         with stage_measure(metrics, "context_view"):
             return finalize_context(corpus, result, view=view, cursor=cursor, refresh=refresh)
@@ -709,31 +864,35 @@ def retrieve(root, run_id, query, anchors=(), budget_chars=None, max_candidates=
         raise
     except (OSError, KeyError, TypeError, AttributeError, UnicodeError, json.JSONDecodeError) as exc:
         raise RetrievalError(f"资料结构无法读取：{exc}") from exc
+    finally:
+        if corpus is not None:
+            corpus.close()
 
 
 def _retrieve(corpus, query, anchors, budget_chars, max_candidates,
-              method_units=(), method_issues=(), *, cross_limit=0, related_only=False, view="evidence"):
+              method_units=(), method_issues=(), *, cross_limit=0, related_only=False, view="evidence", mode="combined"):
     from discovery import discover
 
     ranked, search_issues, exact, reasons = search(corpus, query, anchors, with_exact=True, with_reasons=True)
     # Scan the full session BEFORE lexical/candidate/output limits. Relation discovery
     # is not restricted to observations which happened to fit the returned package.
     discovery_anchors = list(dict.fromkeys(anchors + [key for kind, key in sorted(exact) if kind == "record"]))
-    with stage_measure(corpus.metrics, "discovery"):
-        chain = discover(corpus, query=query, anchors=discovery_anchors)
+    chain = {}
+    if mode == "combined":
+        with stage_measure(corpus.metrics, "discovery"):
+            chain = discover(corpus, query=query, anchors=discovery_anchors)
     relation_keys = [("record", rid) for rid in chain.get("record_refs", []) if rid in corpus.records]
     for key in relation_keys:
         reasons.setdefault(key, []).append({"kind": "capability_relation"})
     explicit = [key for key in ranked if any(r["kind"] == "exact_anchor" for r in reasons.get(key, []))]
     exact_order = explicit + [key for key in ranked if key in exact and key not in explicit]
     relation_ids = {key for _, key in relation_keys}
-    related_blocks = [("block", key) for key, block in corpus.blocks.items()
-                      if relation_ids.intersection(ref_ids(block.get("source_refs", [])))]
+    related_blocks = [("block", key) for key in sorted(corpus.source_blocks(relation_ids))]
     for key in related_blocks:
         reasons.setdefault(key, []).append({"kind": "capability_source"})
     rank_positions = {key: index for index, key in enumerate(ranked)}
-    goals = [r for r in corpus.records.values() if r.get("kind") == "Goal" and r.get("status") == "active"]
-    blockers = [r for r in corpus.records.values() if r.get("kind") == "Step" and r.get("status") == "blocked"]
+    goals = corpus.records_with_flag("goals")
+    blockers = corpus.records_with_flag("blockers")
     diagnostics = list(corpus.load_issues) + list(search_issues) + list(method_issues) + list(chain.get("issues", []))
     navigation, fresh_keys, unclassified_keys, checks = [], [], [], []
     relevant_pages = sorted({corpus.blocks[key]["page_id"] for kind, key in ranked + related_blocks if kind == "block"})
@@ -761,7 +920,16 @@ def _retrieve(corpus, query, anchors, budget_chars, max_candidates,
         relevant.update(("entity", eid) for eid in corpus.records[rid].get("subject_refs", []))
     outside_unclassified = 0
     for kind, group in (("record", corpus.records), ("observation", corpus.observations), ("entity", corpus.entities)):
-        for rid, row in sorted(group.items()):
+        if corpus.metadata is not None:
+            uncertain_ids = sorted(rid for row_kind, rid in corpus.metadata.links("flag")["unclassified"]
+                                   if row_kind == kind)
+        else:
+            uncertain_ids = sorted(group)
+        for rid in uncertain_ids:
+            if corpus.metadata is not None and related_only and (kind, rid) not in relevant:
+                outside_unclassified += 1
+                continue
+            row = group[rid]
             uncertain = row.get("classification") in {"unclassified", "uncertain", "unlinked"}
             uncertain |= kind == "observation" and not row.get("subject_refs")
             if uncertain and related_only and (kind, rid) not in relevant:
@@ -1063,6 +1231,8 @@ def main(argv=None, *, include_methods=False):
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--query", default="")
     parser.add_argument("--anchor", action="append", default=[])
+    parser.add_argument("--mode", choices=("combined", "lexical"), default="combined")
+    parser.add_argument("--question-ref", help="Existing record defining the question and its declared needs")
     parser.add_argument("--budget-chars", type=int, help="可选 JSON 字符预算；默认不限制")
     parser.add_argument("--max-candidates", type=int, help="可选材料候选数；默认不限制")
     parser.add_argument("--cross-limit", type=int, default=0, help="启用观察两两对照并指定结果数；默认关闭")
@@ -1079,7 +1249,8 @@ def main(argv=None, *, include_methods=False):
         result = retrieve(args.root, args.run_id, args.query, args.anchor, args.budget_chars, args.max_candidates,
                           include_methods=include_methods and not args.no_methods,
                           method_ids=args.method_id, method_intents=args.method_intent, cross_limit=args.cross_limit,
-                          view=args.view, cursor=args.cursor, refresh=args.refresh)
+                          view=args.view, cursor=args.cursor, refresh=args.refresh,
+                          mode=args.mode, question_ref=args.question_ref)
     except RetrievalError as exc:
         print(encode({"error": str(exc)}), file=sys.stderr)
         return 2

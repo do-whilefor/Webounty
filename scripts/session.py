@@ -112,7 +112,11 @@ def finish(root, run_id, session_id, export=None):
             "export": str(output) if output else None}
 
 
-def read_ids(corpus, identifiers):
+def read_ids(corpus, identifiers, *, offset=None, length=None):
+    if (offset is None) != (length is None):
+        raise ValueError("range reads require both --offset and --length")
+    if offset is not None and any(identifier not in corpus.artifacts for identifier in identifiers):
+        raise ValueError("range reads address artifact IDs from source_match or provenance")
     wanted = {"record_ids": [], "entity_ids": [], "observation_ids": [], "block_keys": []}
     artifact_ids = []
     for identifier in identifiers:
@@ -127,19 +131,26 @@ def read_ids(corpus, identifiers):
         elif identifier in corpus.blocks:
             wanted["block_keys"].append(identifier)
         elif identifier in corpus.pages:
-            wanted["block_keys"].extend(k for k, v in corpus.blocks.items() if v["page_id"] == identifier)
+            wanted["block_keys"].extend(identifier + "/" + block["block_id"]
+                                        for block in corpus.pages[identifier]["blocks"])
         else:
             raise ValueError("unknown ID: " + identifier)
     package, issues = corpus.package(**wanted)
     if package is not None:
         artifacts = {row["id"]: row for row in package["artifacts"]}
         for aid in artifact_ids:
+            if offset is not None:
+                row = corpus.artifact_window(aid, offset, length)
+                issues.extend(row["issues"])
+                artifacts[aid] = row
+                continue
             artifact = corpus.artifact(aid)
             row = {key: value for key, value in artifact.items() if key != "data"}
             issues.extend(artifact["issues"])
-            if artifact["data"] is not None:
+            data = corpus.artifact_data(aid)
+            if data is not None:
                 try:
-                    row["content"] = artifact["data"].decode("utf-8")
+                    row["content"] = data.decode("utf-8")
                 except UnicodeError:
                     issues.append({"code": "non_text_artifact", "artifact_id": aid})
             artifacts[aid] = row
@@ -165,7 +176,9 @@ def parser():
         if name == "record":
             cmd.add_argument("--input", required=True, help="JSON batch file, or - for stdin")
         elif name == "context":
-            cmd.add_argument("--query", required=True)
+            cmd.add_argument("--query", default="")
+            cmd.add_argument("--mode", choices=("combined", "lexical"), default="combined")
+            cmd.add_argument("--question-ref", help="Existing question/goal/step record to check")
             cmd.add_argument("--anchor", action="append", default=[])
             cmd.add_argument("--budget-chars", type=int)
             cmd.add_argument("--max-candidates", type=int)
@@ -182,6 +195,8 @@ def parser():
             cmd.add_argument("--changed", action="append", default=[])
         elif name == "read":
             cmd.add_argument("--id", action="append", required=True)
+            cmd.add_argument("--offset", type=int, help="Byte offset in an original artifact")
+            cmd.add_argument("--length", type=int, help="Number of original bytes to read")
         elif name == "compare":
             cmd.add_argument("--left", required=True, help="First stored observation ID")
             cmd.add_argument("--right", required=True, help="Second stored observation ID")
@@ -217,14 +232,14 @@ def dispatch(args, *, metrics=None):
         from discovery import discover
         text = sys.stdin.read() if args.input == "-" else Path(args.input).read_text(encoding="utf-8")
         result = publish(root, args.run_id, json.loads(text), metrics=metrics)
-        corpus = Corpus(root, args.run_id, lazy_pages=True, metrics=metrics)
-        with measure(metrics, "discovery"):
-            result["chain_discovery"] = discover(corpus, changed=result["changed_record_ids"])
-        from change_impact import build_impact
-        with measure(metrics, "change_impact"):
-            changed = (result["changed_record_ids"] + result["changed_entity_ids"]
-                       + result["observation_ids"] + result["content_changed_page_ids"])
-            result["change_impact"] = build_impact(corpus, changed, discovery=result["chain_discovery"])
+        with Corpus(root, args.run_id, lazy_pages=True, lazy_metadata=True, metrics=metrics) as corpus:
+            with measure(metrics, "discovery"):
+                result["chain_discovery"] = discover(corpus, changed=result["changed_record_ids"])
+            from change_impact import build_impact
+            with measure(metrics, "change_impact"):
+                changed = (result["changed_record_ids"] + result["changed_entity_ids"]
+                           + result["observation_ids"] + result["content_changed_page_ids"])
+                result["change_impact"] = build_impact(corpus, changed, discovery=result["chain_discovery"])
         log(root, "record", state_revision=result["state_revision"], metrics=metrics)
         return result
     if args.command == "context":
@@ -236,38 +251,40 @@ def dispatch(args, *, metrics=None):
                           budget_chars=args.budget_chars, max_candidates=args.max_candidates,
                           include_methods=not args.no_methods, method_ids=args.method_id,
                           method_intents=args.method_intent, cross_limit=args.cross_limit,
-                          view=args.view, cursor=args.cursor, refresh=args.refresh, metrics=metrics)
+                          view=args.view, cursor=args.cursor, refresh=args.refresh, metrics=metrics,
+                          mode=args.mode, question_ref=args.question_ref)
         log(root, "context", state_revision=result["state_revision"], anchors=args.anchor,
             elapsed_ms=round((perf_counter() - started) * 1000, 3),
-            view=args.view, output_chars=result["budget"]["used_chars"], metrics=metrics)
+            view=args.view, mode=args.mode, question_ref=args.question_ref, output_chars=result["budget"]["used_chars"], metrics=metrics)
         return result
     if args.command == "discover":
         from rag import Corpus
         from discovery import discover
-        corpus = Corpus(root, args.run_id, lazy_pages=True, metrics=metrics)
-        with measure(metrics, "discovery"):
-            result = discover(corpus, args.query, args.anchor, args.changed)
-        if not corpus.stable():
-            raise ValueError("session changed while reading; retrieve current state")
-        log(root, "discover", state_revision=corpus.state["revision"], anchors=args.anchor,
-            changed=args.changed, metrics=metrics)
-        return {"run_id": args.run_id, "state_revision": corpus.state["revision"], **result}
+        with Corpus(root, args.run_id, lazy_pages=True, lazy_metadata=True, metrics=metrics) as corpus:
+            with measure(metrics, "discovery"):
+                result = discover(corpus, args.query, args.anchor, args.changed)
+            if not corpus.stable():
+                raise ValueError("session changed while reading; retrieve current state")
+            log(root, "discover", state_revision=corpus.state["revision"], anchors=args.anchor,
+                changed=args.changed, metrics=metrics)
+            return {"run_id": args.run_id, "state_revision": corpus.state["revision"], **result}
     if args.command == "read":
         from rag import Corpus
         count(metrics, "read_calls")
-        result = read_ids(Corpus(root, args.run_id, lazy_pages=True, metrics=metrics), args.id)
+        with Corpus(root, args.run_id, lazy_pages=True, lazy_metadata=True, metrics=metrics) as corpus:
+            result = read_ids(corpus, args.id, offset=args.offset, length=args.length)
         log(root, "read", ids=args.id, metrics=metrics)
         return result
     if args.command == "compare":
         from rag import Corpus
         from compare_observations import compare
-        corpus = Corpus(root, args.run_id, lazy_pages=True, metrics=metrics)
-        result = compare(corpus, args.left, args.right, fields=args.field)
-        if not corpus.stable():
-            raise ValueError("session changed while comparing; read current observations")
-        log(root, "compare", state_revision=corpus.state["revision"],
-            observation_ids=[args.left, args.right], fields=args.field, metrics=metrics)
-        return {"run_id": args.run_id, "state_revision": corpus.state["revision"], **result}
+        with Corpus(root, args.run_id, lazy_pages=True, lazy_metadata=True, metrics=metrics) as corpus:
+            result = compare(corpus, args.left, args.right, fields=args.field)
+            if not corpus.stable():
+                raise ValueError("session changed while comparing; read current observations")
+            log(root, "compare", state_revision=corpus.state["revision"],
+                observation_ids=[args.left, args.right], fields=args.field, metrics=metrics)
+            return {"run_id": args.run_id, "state_revision": corpus.state["revision"], **result}
     if args.command == "audit":
         from store import audit
         return audit(root, args.run_id)

@@ -36,10 +36,10 @@ class SessionReplayTests(unittest.TestCase):
         self.assertEqual(path["status"], "candidate")
         self.assertEqual(renamed["delivered_record_ids"], [])
 
-    def test_counterevidence_retransmits_the_same_judgment_and_blocks_old_paths(self):
+    def test_counterevidence_revises_review_state_retransmits_judgment_and_blocks_old_paths(self):
         old = self.turns["new_input_reopens_blocked"]
         changed = self.turns["counterevidence_changes_route"]
-        self.assertEqual(old["current_record_revisions"]["R-GRANT"], changed["current_record_revisions"]["R-GRANT"])
+        self.assertGreater(changed["current_record_revisions"]["R-GRANT"], old["current_record_revisions"]["R-GRANT"])
         self.assertIn("R-GRANT", changed["delivered_record_ids"])
         self.assertEqual(changed["counterevidence_coverage"]["observations"]["coverage"], 1.0)
         self.assertFalse(any("R-GRANT" in row["record_refs"] for row in changed["paths"]))
@@ -63,10 +63,11 @@ class SessionReplayTests(unittest.TestCase):
             with self.subTest(group=group):
                 self.assertGreater(sum(row["file_reads"].get(group, {}).get("calls", 0) for row in measurements), 0)
                 self.assertGreater(sum(row["file_reads"].get(group, {}).get("bytes", 0) for row in measurements), 0)
-        # A query reads the state initially and again during snapshot stability
-        # checks. The latter must not disappear from the external measurement.
+        # Publication reads the authoritative JSON. A current query projection
+        # avoids reopening the whole state while originals remain measured.
         initial = self.turns["initial_missing_input"]["retrieval"]["file_reads"]
-        self.assertGreaterEqual(initial["state"]["opens"], 2)
+        self.assertEqual(initial.get("state", {}).get("opens", 0), 0)
+        self.assertGreater(initial["evidence"]["bytes"], 0)
 
     def test_read_helpers_and_open_streams_are_counted_once(self):
         with tempfile.TemporaryDirectory() as directory:

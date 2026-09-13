@@ -50,13 +50,15 @@ def build_type_reviews(records, focus_refs, candidates=None):
     # while both features continue to use exactly the same matching semantics.
     from discovery import _constraint_check, _names
 
-    focus = sorted(set(focus_refs).intersection(records))
+    focus = sorted(rid for rid in set(focus_refs) if rid in records)
     demands = [(rid, index, spec) for rid in focus
                for index, spec in enumerate(records[rid].get("capability", {}).get("needs", []))]
     if not demands:
         return []
 
-    names, postings = defaultdict(set), defaultdict(set)
+    metadata = getattr(records, "relations", None)
+    names = metadata.links("named_provides") if metadata is not None else defaultdict(set)
+    postings = metadata.links("hint_term") if metadata is not None else defaultdict(set)
     providers, record_terms = {}, {}
     diagnosed = defaultdict(lambda: defaultdict(list))
     for edge in candidates or ():
@@ -69,7 +71,7 @@ def build_type_reviews(records, focus_refs, candidates=None):
             record_terms[rid] = _terms(row.get("summary", "")) | _terms(row.get("title", ""))
         return record_terms[rid]
 
-    for rid, row in records.items():
+    for rid, row in (() if metadata is not None else records.items()):
         for index, spec in enumerate(row.get("capability", {}).get("provides", [])):
             key = (rid, index)
             providers[key] = spec
@@ -116,7 +118,8 @@ def build_type_reviews(records, focus_refs, candidates=None):
         suggestions = []
         for key in sorted(shared, key=lambda key: (-len(shared[key]), key)):
             pid, provide_index = key
-            provided = providers[key]
+            provided = (records[pid]["capability"]["provides"][provide_index]
+                        if metadata is not None else providers[key])
             conflicts, unknown = _constraint_check(provided, need)
             suggestions.append({
                 "producer_ref": pid, "provide_index": provide_index, "type": provided["type"],

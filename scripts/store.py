@@ -16,6 +16,7 @@ import re
 from discovery import _names
 from page_checks import PageChecks
 from rag import CORRECTIONS, Corpus, RetrievalError, dependencies, digest, encode, ref_ids, signature
+from evidence_io import FileCopy, scan
 from telemetry import count, measure
 from wiki_structure import navigation_paths
 
@@ -196,37 +197,32 @@ def _remember_change(previous, row):
     row.setdefault("history", []).append(entry)
 
 
-def _invalidate_chains(state, changed, explicit, entities=()):
+def _invalidate_dependents(state, changed, explicit, entities=()):
+    from collections import defaultdict, deque
+
     affected = set(changed) | set(entities)
     for rid in changed:
         row = state["records"][rid]
         for field in (*CORRECTIONS, "contradicts", "contradicting_fact_ids"):
             affected.update(ref_ids(row.get(field, [])))
-    invalidated = []
-
-    def invalidate(rid, row):
-        if row.get("kind") == "Chain" and rid not in explicit and rid not in invalidated:
+    dependents, invalidated = defaultdict(set), []
+    for rid, row in state["records"].items():
+        for ref in dependencies(row) | set(row.get("subject_refs", [])):
+            dependents[ref].add(rid)
+    pending = deque(sorted(affected))
+    while pending:
+        rid = pending.popleft()
+        row = state["records"].get(rid)
+        if row and row.get("kind") in {"Chain", "Capability", "Finding"} and rid not in explicit:
             previous = dict(row)
             row["status"] = "needs_review"
             row["revision"] += 1
-            row["change_reason"] = "Source records or counterevidence changed; review the chain."
+            row["change_reason"] = "Source records, conditions or counterevidence changed; review this judgment."
             _remember_change(previous, row)
             invalidated.append(rid)
-
-    for rid in affected:
-        if rid in state["records"]:
-            invalidate(rid, state["records"][rid])
-    while True:
-        added = set()
-        for rid, row in state["records"].items():
-            if rid in affected:
-                continue
-            if (dependencies(row) | set(row.get("subject_refs", []))) & affected:
-                added.add(rid)
-                invalidate(rid, row)
-        if not added:
-            break
-        affected.update(added)
+        for dependent in sorted(dependents[rid] - affected):
+            affected.add(dependent)
+            pending.append(dependent)
     return invalidated
 
 
@@ -527,15 +523,28 @@ class _ProposedCorpus(Corpus):
         if key not in self.proposed_files:
             return super().read_bytes(relative)
         path = self.path(relative)
-        if path not in self.read_files:
-            data = self.proposed_files[key]
-            if len(data) > self.MAX_FILE_BYTES:
-                raise RetrievalError("proposed file exceeds Corpus size limit")
-            self.total_bytes += len(data)
-            if self.total_bytes > self.MAX_TOTAL_BYTES:
-                raise RetrievalError("proposed corpus exceeds total read limit")
-            self.read_files[path] = data
-        return self.read_files[path]
+        data = self.proposed_files[key]
+        if isinstance(data, FileCopy):
+            return data.source.read_bytes()
+        self.read_files.setdefault(path, None)
+        return data
+
+    def source_path(self, relative):
+        proposed = self.proposed_files.get(Path(relative).as_posix())
+        return proposed.source if isinstance(proposed, FileCopy) else super().source_path(relative)
+
+    def file_size(self, relative):
+        proposed = self.proposed_files.get(Path(relative).as_posix())
+        if proposed is not None:
+            return proposed.metadata["bytes"] if isinstance(proposed, FileCopy) else len(proposed)
+        return super().file_size(relative)
+
+    def inspect_file(self, relative):
+        proposed = self.proposed_files.get(Path(relative).as_posix())
+        if isinstance(proposed, bytes):
+            self.read_files.setdefault(self.path(relative), None)
+            return {"sha256": digest(proposed), "bytes": len(proposed)}
+        return super().inspect_file(relative)
 
 
 def _prepare_publication(root, run_id, batch, current):
@@ -586,16 +595,16 @@ def _prepare_publication(root, run_id, batch, current):
             if (source.resolve() in current.derived_paths or source.resolve() == root / "wiki/index.md"
                     or source.resolve().is_relative_to(root / "cache")):
                 raise RetrievalError("derived session documents cannot be imported as original evidence")
-            data = source.read_bytes()
+            metadata = scan(source)
             aid, path = "SRC-" + oid, f"evidence/{oid}.source"
             if aid in state["artifacts"]:
                 raise RetrievalError(f"artifact {aid} already exists")
             state["artifacts"][aid] = {"id": aid, "run_id": run_id, "kind": "source", "sealed": True,
-                                       "path": path, "bytes": len(data), "sha256": digest(data)}
-            files[path] = data
+                                       "path": path, **{key: metadata[key] for key in ("bytes", "sha256", "text_encoding")}}
+            files[path] = FileCopy(source, metadata)
             immutable.add(path)
             index["source_artifact_id"] = aid
-            content["source_artifact"] = {"artifact_id": aid, "path": path, "sha256": digest(data)}
+            content["source_artifact"] = {"artifact_id": aid, "path": path, "sha256": metadata["sha256"]}
         data, path = _json_bytes(content), f"evidence/{oid}.jsonl"
         index["content_hash"] = digest(data)
         if index["artifact_id"] in state["artifacts"]:
@@ -615,7 +624,7 @@ def _prepare_publication(root, run_id, batch, current):
             if aid and aid not in known:
                 refs.append({"artifact_id": aid})
                 known.add(aid)
-    invalidated = _invalidate_chains(state, changed_records, set(changed_records), changed_entities)
+    invalidated = _invalidate_dependents(state, changed_records, set(changed_records), changed_entities)
     changed_records.extend(invalidated)
     _validate_state(state)
     pages = {page["page_id"]: page for page in manifest["pages"]}
@@ -677,6 +686,8 @@ def publish(root, run_id, batch, metrics=None):
         raise RetrievalError("publication must be an object")
     with measure(metrics, "publish.load"):
         current = Corpus(root, run_id, lazy_pages=True, metrics=metrics)
+        from retrieval_index import snapshot, sync_publication
+        current.index_snapshot = snapshot(current)
     with measure(metrics, "publish.prepare"):
         (supplied, state, pages, page_inputs, metadata_pages, files, immutable,
          changed_records, changed_entities, invalidated) = _prepare_publication(root, run_id, batch, current)
@@ -708,18 +719,25 @@ def publish(root, run_id, batch, metrics=None):
             target = current.path(path)
             target.parent.mkdir(parents=True, exist_ok=True)
             with target.open("xb" if path in immutable else "wb") as stream:
-                stream.write(data)
+                if isinstance(data, FileCopy):
+                    data.write_to(stream)
+                else:
+                    stream.write(data)
         checker.save()
     count(metrics, "publish_pages_loaded", len(current.loaded_pages | proposed.loaded_pages))
     actual_reads = set(current.read_files) | {
-        path for path in proposed.read_files if path.relative_to(root).as_posix() not in proposed.proposed_files}
+        path for path in proposed.read_files if path.is_relative_to(root)
+        and path.relative_to(root).as_posix() not in proposed.proposed_files}
     count(metrics, "publish_evidence_files_read", len({path for path in actual_reads
                                                      if path.is_relative_to(root / "evidence")}))
     result = {"changed_record_ids": changed_records, "changed_entity_ids": changed_entities,
               "changed_page_ids": list(page_inputs),
               "content_changed_page_ids": [pid for pid in page_inputs if pid not in metadata_pages],
               "observation_ids": [row["id"] for row in supplied["observations"]],
-              "state_revision": state["revision"], "needs_review_chain_ids": invalidated}
+              "state_revision": state["revision"], "needs_review_record_ids": invalidated,
+              "needs_review_chain_ids": [rid for rid in invalidated if state["records"][rid]["kind"] == "Chain"]}
+    with measure(metrics, "publish.retrieval_index"):
+        result["retrieval_index"] = sync_publication(current, root, run_id, result, metrics)
     (root / "logs").mkdir(exist_ok=True)
     with (root / "logs/store.jsonl").open("a", encoding="utf-8") as stream:
         stream.write(encode({"operation": "publish", "at": datetime.now(timezone.utc).isoformat(), **result}) + "\n")

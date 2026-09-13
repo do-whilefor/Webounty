@@ -114,62 +114,66 @@ def build_impact(corpus, changed, discovery=None):
     if not changed_refs:
         return out
 
-    edges = defaultdict(set)
+    if getattr(corpus, "metadata", None) is not None:
+        from metadata_cache import ImpactEdges
+        edges = ImpactEdges(corpus, nodes)
+    else:
+        edges = defaultdict(set)
 
-    def link(source, target, reason):
-        if source in nodes and target in nodes:
-            edges[nodes[source]].add((nodes[target], reason))
+        def link(source, target, reason):
+            if source in nodes and target in nodes:
+                edges[nodes[source]].add((nodes[target], reason))
 
-    scoped_pages = defaultdict(set)
-    for pid, page in corpus.pages.items():
-        for subject in page.get("discovery_scope", {}).get("subject_refs", []):
-            scoped_pages[subject].add(pid)
-        for field in ("source_refs", "record_refs", "subject_refs"):
-            for ref in _refs(page.get(field, [])):
-                link(ref, pid, "page_source_changed")
-    for rid, row in corpus.records.items():
-        contradictions = set(_refs(row.get("contradicts", [])))
-        corrections = {ref for field in CORRECTIONS for ref in _refs(row.get(field, []))}
-        # A replacement affects the old judgment, not the other way around.
-        for ref in corpus.record_dependencies[rid] - contradictions:
-            link(ref, rid, "counterevidence_changed" if ref in corrections else "dependency_changed")
-        for ref in contradictions:
-            link(rid, ref, "counterevidence_changed")
-        for ref in _refs(row.get("observation_refs", [])):
-            link(ref, rid, "observation_changed")
-        for ref in row.get("artifact_refs", []):
-            link(ref["artifact_id"], rid, "artifact_changed")
-        for connection in row.get("links", []):
-            for ref in _refs(connection.get("evidence_refs", [])):
-                link(ref, rid, "connection_evidence_changed")
-        for subject in _refs(row.get("subject_refs", [])):
-            link(subject, rid, "subject_changed")
-            for pid in scoped_pages[subject]:
-                link(rid, pid, "scoped_record_changed")
-    for oid, row in corpus.observations.items():
-        for field in ("artifact_id", "source_artifact_id"):
-            if row.get(field):
-                link(row[field], oid, "artifact_changed")
-        for subject in _refs(row.get("subject_refs", [])):
-            link(subject, oid, "subject_changed")
-            for pid in scoped_pages[subject]:
-                link(oid, pid, "scoped_observation_changed")
-    for eid, row in corpus.entities.items():
-        for field in ("owner_ref", "tenant_ref", "asset_ref"):
-            if row.get(field):
-                link(row[field], eid, "entity_context_changed")
-        for field in ("source_refs", "observation_refs"):
-            for ref in _refs(row.get(field, [])):
-                link(ref, eid, "entity_source_changed")
-    for bid, block in corpus.blocks.items():
-        for field in ("source_refs", "subject_refs"):
-            for ref in _refs(block.get(field, [])):
-                link(ref, bid, "block_source_changed")
-        for ref in block.get("artifact_refs", []):
-            link(ref["artifact_id"], bid, "artifact_changed")
-        for ref in block.get("required_block_refs", []):
-            link(ref["page_id"] + "/" + ref["block_id"], bid, "required_block_changed")
-        link(bid, block["page_id"], "block_changed")
+        scoped_pages = defaultdict(set)
+        for pid, page in corpus.pages.items():
+            for subject in page.get("discovery_scope", {}).get("subject_refs", []):
+                scoped_pages[subject].add(pid)
+            for field in ("source_refs", "record_refs", "subject_refs"):
+                for ref in _refs(page.get(field, [])):
+                    link(ref, pid, "page_source_changed")
+        for rid, row in corpus.records.items():
+            contradictions = set(_refs(row.get("contradicts", [])))
+            corrections = {ref for field in CORRECTIONS for ref in _refs(row.get(field, []))}
+            # A replacement affects the old judgment, not the other way around.
+            for ref in corpus.record_dependencies[rid] - contradictions:
+                link(ref, rid, "counterevidence_changed" if ref in corrections else "dependency_changed")
+            for ref in contradictions:
+                link(rid, ref, "counterevidence_changed")
+            for ref in _refs(row.get("observation_refs", [])):
+                link(ref, rid, "observation_changed")
+            for ref in row.get("artifact_refs", []):
+                link(ref["artifact_id"], rid, "artifact_changed")
+            for connection in row.get("links", []):
+                for ref in _refs(connection.get("evidence_refs", [])):
+                    link(ref, rid, "connection_evidence_changed")
+            for subject in _refs(row.get("subject_refs", [])):
+                link(subject, rid, "subject_changed")
+                for pid in scoped_pages[subject]:
+                    link(rid, pid, "scoped_record_changed")
+        for oid, row in corpus.observations.items():
+            for field in ("artifact_id", "source_artifact_id"):
+                if row.get(field):
+                    link(row[field], oid, "artifact_changed")
+            for subject in _refs(row.get("subject_refs", [])):
+                link(subject, oid, "subject_changed")
+                for pid in scoped_pages[subject]:
+                    link(oid, pid, "scoped_observation_changed")
+        for eid, row in corpus.entities.items():
+            for field in ("owner_ref", "tenant_ref", "asset_ref"):
+                if row.get(field):
+                    link(row[field], eid, "entity_context_changed")
+            for field in ("source_refs", "observation_refs"):
+                for ref in _refs(row.get(field, [])):
+                    link(ref, eid, "entity_source_changed")
+        for bid, block in corpus.blocks.items():
+            for field in ("source_refs", "subject_refs"):
+                for ref in _refs(block.get(field, [])):
+                    link(ref, bid, "block_source_changed")
+            for ref in block.get("artifact_refs", []):
+                link(ref["artifact_id"], bid, "artifact_changed")
+            for ref in block.get("required_block_refs", []):
+                link(ref["page_id"] + "/" + ref["block_id"], bid, "required_block_changed")
+            link(bid, block["page_id"], "block_changed")
 
     origins, reasons = defaultdict(set), defaultdict(lambda: defaultdict(set))
     pending = deque()

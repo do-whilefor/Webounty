@@ -5,9 +5,11 @@ from __future__ import annotations
 from collections import Counter, defaultdict, deque
 from math import log1p
 import re
+import unicodedata
 
 
-_TOKENS = re.compile(r"[a-z0-9_]+(?:[-/.][a-z0-9_]+)*|[\u3400-\u9fff]+")
+_TOKENS = re.compile(r"[a-z0-9_]+(?:[-/.][a-z0-9_]+)*|[\u3400-\u9fff]+", re.I)
+_CAMEL = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
 _PARTS = re.compile(r"[a-z0-9]+")
 _BOUNDARY_TOKENS = re.compile(r"[\w-]+|[^\w-]", re.UNICODE)
 _ANCHOR_TAG = re.compile(r'<a\s+id="[^"]+"\s*></a>', re.I)
@@ -28,7 +30,7 @@ _BOOKKEEPING = frozenset({
 _WEIGHTS = {
     "title": 3.0, "aliases": 2.5, "summary": 2.0,
     "questions": 2.0, "keywords": 2.2, "body": 1.0, "knowledge": 0.5, "page": 0.25,
-    "navigation": 0.8,
+    "navigation": 0.8, "source": 1.0,
 }
 
 
@@ -49,8 +51,9 @@ def _text(value, *, keys=False):
 
 def _terms(value):
     """Preserve endpoint/identifier tokens and add components and Chinese bigrams."""
-    for match in _TOKENS.finditer(value.casefold()):
-        token = match.group()
+    for match in _TOKENS.finditer(unicodedata.normalize("NFKC", value)):
+        original = match.group()
+        token = original.casefold()
         if "\u3400" <= token[0] <= "\u9fff":
             if len(token) == 1:
                 yield token
@@ -60,6 +63,10 @@ def _terms(value):
             yield token
             if "/" in token or "." in token or "-" in token or "_" in token:
                 yield from _PARTS.findall(token)
+            components = _CAMEL.split(original)
+            if len(components) > 1:
+                for component in components:
+                    yield from _PARTS.findall(component.casefold())
 
 
 def _refs(value):
@@ -256,32 +263,44 @@ def rank(corpus, query, anchors, *, with_exact=False, with_reasons=False):
     def may_occur(value):
         return value[:2] in (initial_chars if len(value) == 1 else prefixes)
 
-    documents = {}
+    metadata = getattr(corpus, "metadata", None)
     aliases, identifiers = defaultdict(set), defaultdict(set)
-    for kind, group in (("record", corpus.records), ("entity", corpus.entities),
-                        ("observation", corpus.observations), ("block", corpus.blocks)):
-        for rid, row in group.items():
-            key = kind, rid
-            documents[key] = row
-            ids = [rid]
-            if kind == "block":
-                ids.extend((row["block_id"], row["page_id"]))
+    if metadata is not None:
+        from metadata_cache import Documents
+        documents = Documents(corpus)
+        for category, value, alias_kind, kind, rid in metadata.union("search_name", prefixes | initial_chars):
+            if category == "id":
+                identifiers[value].add((kind, rid))
             else:
-                alias_kind = row.get("kind", kind).casefold()
-                for alias in [row.get("title", "")] + row.get("aliases", []):
-                    alias = alias.casefold()
-                    if alias and may_occur(alias):
-                        aliases[(alias_kind, alias)].add(key)
-            for identifier in ids:
-                identifier = identifier.casefold()
-                if may_occur(identifier):
-                    identifiers[identifier].add(key)
+                aliases[(alias_kind, value)].add((kind, rid))
+    else:
+        documents = {}
+        for kind, group in (("record", corpus.records), ("entity", corpus.entities),
+                            ("observation", corpus.observations), ("block", corpus.blocks)):
+            for rid, row in group.items():
+                key = kind, rid
+                documents[key] = row
+                ids = [rid]
+                if kind == "block":
+                    ids.extend((row["block_id"], row["page_id"]))
+                else:
+                    alias_kind = row.get("kind", kind).casefold()
+                    for alias in [row.get("title", "")] + row.get("aliases", []):
+                        alias = alias.casefold()
+                        if alias and may_occur(alias):
+                            aliases[(alias_kind, alias)].add(key)
+                for identifier in ids:
+                    identifier = identifier.casefold()
+                    if may_occur(identifier):
+                        identifiers[identifier].add(key)
 
     terms = set(_terms(query))
     if terms and hasattr(corpus, "root"):
         from retrieval_index import lexical_projection
         postings, field_lengths, averages, roles, unavailable = lexical_projection(
             corpus, documents, terms, _fields, _terms, _role)
+    elif metadata is not None and not terms:
+        postings, field_lengths, averages, roles, unavailable = {}, {}, {}, {}, set()
     else:
         postings, field_lengths, averages, roles, unavailable = _memory_projection(corpus, documents, terms)
     scores = defaultdict(float)
@@ -366,13 +385,16 @@ def rank(corpus, query, anchors, *, with_exact=False, with_reasons=False):
         if kind == "block":
             hit_records.update(_refs(corpus.blocks[rid].get("source_refs", [])))
     correction_targets = set()
-    for rid, row in corpus.records.items():
+    correction_rows = ((rid, corpus.records[rid]) for rid in hit_records) if metadata is not None else corpus.records.items()
+    for rid, row in correction_rows:
         if rid in hit_records:
             for field in ("corrected_by", "superseded_by", "correction_refs", "contradicted_by"):
                 correction_targets.update(_refs(row.get(field, [])))
         if hit_records.intersection(_refs(row.get("contradicts", []))):
             correction_targets.add(rid)
-    for rid in correction_targets & corpus.records.keys():
+    if metadata is not None:
+        correction_targets.update(metadata.union("contradiction", hit_records))
+    for rid in sorted(rid for rid in correction_targets if rid in corpus.records):
         if corpus.records[rid].get("status", "").casefold() in {"refuted", "withdrawn", "superseded", "corrected"}:
             continue
         key = "record", rid
@@ -386,9 +408,16 @@ def rank(corpus, query, anchors, *, with_exact=False, with_reasons=False):
         elif kind in {"record", "observation"}:
             subjects.update(_refs(documents[(kind, rid)].get("subject_refs", [])))
     exact_ids = {rid for _, rid in exact}
-    for bid, block in corpus.blocks.items():
+    if metadata is not None:
+        block_ids = {rid for kind, rid in scores.keys() | exact if kind == "block"}
+        block_ids.update(metadata.union("source_block", exact_ids))
+        block_ids.update(metadata.union("subject_block", subjects))
+        block_rows = ((bid, corpus.blocks[bid]) for bid in sorted(block_ids))
+    else:
+        block_rows = corpus.blocks.items()
+    for bid, block in block_rows:
         key = "block", bid
-        role = roles.get(key, block.get("role", "explanation"))
+        role = roles.get(key, _role(block) if metadata is not None and not terms else block.get("role", "explanation"))
         if key in scores and key not in exact:
             scores[key] *= 0.25 if role in {"history", "related"} else 0.08 if role in {"navigation", "index", "sources"} else 1
         if key in exact or role in {"navigation", "index", "sources", "history", "related"}:
