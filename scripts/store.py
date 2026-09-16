@@ -14,6 +14,7 @@ import posixpath
 import re
 
 from discovery import _names
+from conditions import known as _known
 from page_checks import PageChecks
 from rag import CORRECTIONS, Corpus, RetrievalError, dependencies, digest, encode, ref_ids, signature
 from evidence_io import FileCopy, scan
@@ -24,7 +25,6 @@ from wiki_structure import navigation_paths
 PAGE_KINDS = {"entity", "flow", "capability", "question", "chain"}
 RETRIEVAL_FIELDS = ("summary", "questions", "keywords", "aliases", "retrieval")
 PAGE_METADATA = {"id", "title", "kind", "parent_page_id", *RETRIEVAL_FIELDS}
-UNKNOWN = {"", "unknown", "unspecified", "not_recorded", "未知", "未记录"}
 
 
 def _identifier(value):
@@ -89,10 +89,6 @@ def _record_observations(state, seeds):
         observations.update(row.get("observation_refs", []))
         pending.extend(dependencies(row))
     return observations
-
-
-def _known(value):
-    return value.strip().casefold() not in UNKNOWN
 
 
 def _verified_compatibility(provided, needed, link_conditions, chain_conditions):
@@ -213,9 +209,13 @@ def _invalidate_dependents(state, changed, explicit, entities=()):
     while pending:
         rid = pending.popleft()
         row = state["records"].get(rid)
-        if row and row.get("kind") in {"Chain", "Capability", "Finding"} and rid not in explicit:
+        if row and row.get("kind") in {"Chain", "Capability", "Finding", "Fact", "Question", "Step"} and rid not in explicit:
             previous = dict(row)
-            row["status"] = "needs_review"
+            # Keep workflow/historical status on facts and questions. Basis validity
+            # is independent of whether the author marked the task open or complete.
+            row["basis_status"] = "needs_review"
+            if row["kind"] in {"Chain", "Capability", "Finding"}:
+                row["status"] = "needs_review"
             row["revision"] += 1
             row["change_reason"] = "Source records, conditions or counterevidence changed; review this judgment."
             _remember_change(previous, row)
@@ -297,9 +297,13 @@ def _status(row):
 def _record_text(row, state, canonical=None):
     canonical = canonical or {}
     lines = [row.get("summary", ""), "", f"- 记录：`{row['id']}`", f"- 当前状态：{_status(row)}"]
+    if row.get("basis_status") == "needs_review":
+        lines.append("- 依据状态：待复核；历史作者状态不表示当前依据仍有效。")
     if row.get("conditions"):
         lines.append("- 适用条件：" + encode(row["conditions"]))
     optional = (
+        ("hard_constraints", "用户硬约束（原文）"), ("next_action", "下一步"),
+        ("active_question_ref", "当前问题引用"),
         ("question", "当前问题"), ("hypothesis", "假设（待判命题）"),
         ("expected", "支持判据（预期，不代表已经发生）"), ("falsifier", "反证判据（预期）"),
         ("test", "检查记录"), ("experiment", "实验记录"),
@@ -572,6 +576,13 @@ def _prepare_publication(root, run_id, batch, current):
                                             if ref["artifact_id"] not in old_imports]
                 if old:
                     row["change_reason"] = raw.get("change_reason", "Updated by an explicit publication.")
+                if raw.get("reviewed") is True:
+                    if not raw.get("change_reason"):
+                        raise RetrievalError("reviewed records require a change_reason")
+                    row.pop("basis_status", None)
+                elif old.get("basis_status") == "needs_review":
+                    row["basis_status"] = "needs_review"
+                row.pop("reviewed", None)
                 if row["kind"] == "Chain":
                     row["step_refs"] = list(row.get("steps", []))
                 if old:
@@ -588,6 +599,10 @@ def _prepare_publication(root, run_id, batch, current):
         index = {"id": oid, "revision": 1, "run_id": run_id, "summary": raw.get("summary", ""),
                  "subject_refs": raw.get("subject_refs", []), "artifact_id": "ART-" + oid, "line": 1}
         content["subject_refs"] = index["subject_refs"]
+        if "excerpt_selectors" in raw:
+            from excerpts import validate_selectors
+            validate_selectors(raw["excerpt_selectors"])
+            index["excerpt_selectors"] = copy.deepcopy(raw["excerpt_selectors"])
         if raw.get("source_path"):
             source = Path(raw["source_path"])
             if not source.is_absolute() or not source.is_file():
@@ -707,7 +722,17 @@ def publish(root, run_id, batch, metrics=None):
             issues.extend(proposed.page_issues[pid])
             for block in pages[pid]["blocks"]:
                 issues.extend(proposed.blocks[f'{pid}/{block["block_id"]}']["_issues"])
-        allowed = {"stale_source", "condition_change", "new_candidates", "removed_candidates", "reasoning_review_required", "non_text_artifact"}
+        # Publishing records can deliberately preserve disputed historical claims.
+        allowed = {"stale_source", "condition_change", "new_candidates", "removed_candidates", "reasoning_review_required", "non_text_artifact",
+                   "basis_review_required", "record_has_correction"}
+        reviewed = {row["id"] for row in supplied["records"] if row.get("reviewed") is True}
+        from discovery import _Sources
+        checker_sources = _Sources(proposed)
+        for rid in reviewed:
+            invalid_basis = {"stale_source", "basis_review_required", "missing_source_record",
+                             "missing_observation", "observation_unavailable", "source_cycle"}
+            if any(item["code"] in invalid_basis for item in checker_sources.inspect(rid)["issues"]):
+                raise RetrievalError("reviewed record still has unresolved source checks: " + rid)
         if package is None or any(issue["code"] not in allowed for issue in issues):
             raise RetrievalError("invalid publication: " + encode(issues))
     with measure(metrics, "publish.wiki_index"):

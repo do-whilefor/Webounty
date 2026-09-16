@@ -51,7 +51,8 @@ def compact_observation(source):
     row["raw_expanded"] = False
     row["read_ref"] = row["id"]
     context = {key: raw[key] for key in (
-        "actor_ref", "environment", "session_generation", "stage", "signal_kind", "request_object_refs",
+        "actor_ref", "environment", "session_generation", "credential_generation", "target_version",
+        "observed_at", "trace_ref", "truncated", "stage", "signal_kind", "request_object_refs",
     ) if key in raw}
     request = raw.get("request", {})
     if isinstance(request, dict):
@@ -98,6 +99,24 @@ def compact_mandatory(mandatory):
         "goal_refs": mandatory.get("goal_refs", [row["id"] for row in mandatory.get("goals", [])]),
         "blocker_refs": mandatory.get("blocker_refs", [row["id"] for row in mandatory.get("blockers", [])]),
     }
+
+
+def task_core(corpus, result):
+    """Small current-state projection; never remembered separately from the Wiki."""
+    goals = []
+    for row in corpus.records_with_flag("goals"):
+        goals.append({key: row[key] for key in (
+            "id", "summary", "hard_constraints", "scope", "next_action", "active_question_ref") if key in row})
+    request = result.get("retrieval_request", {})
+    question_ref = request.get("question_ref")
+    current = corpus.records.get(question_ref, {}) if question_ref else {}
+    return {"goals": goals, "question_ref": question_ref,
+            "next_action": current.get("next_action"),
+            "current_conditions": getattr(corpus, "current_conditions", {}),
+            "review_refs": sorted({row.get("record_id", row.get("id")) for row in result.get("gaps", [])
+                                   if row.get("code") in {"basis_review_required", "stale_source", "record_has_correction",
+                                                          "current_condition_conflict", "current_condition_unknown"}
+                                   and (row.get("record_id") or row.get("id"))})}
 
 
 def _compact(corpus, result):
@@ -251,7 +270,7 @@ def _block_dependency_signatures(result, source_signature):
     return signatures
 
 
-def finalize_context(corpus, result, *, view="compact", cursor=None, refresh=False):
+def finalize_context(corpus, result, *, view="compact", cursor=None, refresh=False, context_epoch=None):
     """Apply a view after retrieval; an optional cursor sends only changed units.
 
     ``refresh`` resets all remembered delivery signatures for this view/cursor,
@@ -263,24 +282,32 @@ def finalize_context(corpus, result, *, view="compact", cursor=None, refresh=Fal
         raise ValueError("view must be compact or evidence")
     if cursor is not None and (not isinstance(cursor, str) or not cursor.strip()):
         raise ValueError("cursor must be a nonempty name")
-    if refresh and cursor is None:
-        raise ValueError("refresh requires a cursor")
+    if (refresh or context_epoch is not None) and cursor is None:
+        raise ValueError("refresh/context_epoch requires a cursor")
+    if context_epoch is not None and (not isinstance(context_epoch, str) or not context_epoch.strip()):
+        raise ValueError("context_epoch must be a nonempty string")
     out = (result if view == "evidence" and cursor is None else
            _compact(corpus, result) if view == "compact" and result.get("view") != "compact"
            else {**result, "budget": dict(result["budget"]), "view": view})
+    if (view == "compact" or cursor is not None) and not any(
+            gap.get("code") == "snapshot_changed" for gap in result.get("gaps", [])):
+        out["task_core"] = task_core(corpus, result)
     cursor_path, saved = None, None
     if cursor is not None:
-        scope = {"version": 1, "run_id": corpus.run_id, "session_id": corpus.state.get("session_id"), "view": view}
+        scope = {"version": 2, "run_id": corpus.run_id, "session_id": corpus.state.get("session_id"), "view": view}
         cursor_path = Path(corpus.root) / "cache" / ("context-" + _hash({**scope, "cursor": cursor}) + ".json")
         previous = json.loads(cursor_path.read_text(encoding="utf-8")) if cursor_path.exists() else None
+        epoch_changed = previous is not None and previous.get("context_epoch") != context_epoch
+        reset_reason = "explicit_refresh" if refresh else "context_epoch_changed" if epoch_changed else "new_cursor" if previous is None else None
+        refresh = refresh or epoch_changed
         delivered = {} if refresh or previous is None else dict(previous["delivered"])
         queries = {} if refresh or previous is None else dict(previous.get("queries", {}))
-        saved = {**scope, "delivered": dict(delivered), "queries": queries}
+        saved = {**scope, "context_epoch": context_epoch, "delivered": dict(delivered), "queries": queries}
         source_view = _compact(corpus, result) if view == "evidence" else out
         query_units = {}
         source_signature = _source_signatures(corpus, source_view)
         block_dependencies = _block_dependency_signatures(source_view, source_signature)
-        delta = {"cursor": cursor, "refresh": refresh, "scope": "current_result_only", "changes": [],
+        delta = {"cursor": cursor, "refresh": refresh, "context_epoch": context_epoch, "reset_reason": reset_reason, "scope": "current_result_only", "changes": [],
                  "metadata_changes": [], "cursor_advanced": False}
         unchanged = []
 
@@ -391,6 +418,19 @@ def finalize_context(corpus, result, *, view="compact", cursor=None, refresh=Fal
                                                        discovery=result.get("chain_discovery", {}))
                 out["change_impact"]["basis"] = "new_or_changed_since_cursor_delivery"
 
+    # Task-core and impact expansion can touch sources after initial retrieval.
+    # Never acknowledge a delta assembled across two different snapshots.
+    if not corpus.stable():
+        out = {"run_id": corpus.run_id, "state_revision": corpus.state["revision"],
+               "status": "unavailable", "view": view,
+               "gaps": [{"code": "snapshot_changed", "detail": "资料在视图构建期间变化，请重新读取。"}],
+               "budget": {**result["budget"], "used_chars": 0},
+               **{group: [] for group in _GROUPS},
+               "chain_discovery": {group: [] for group in _DISCOVERY_GROUPS}}
+        if cursor is not None:
+            out["delta"] = {"cursor_advanced": False}
+        _measure(out)
+        return out
     limit = out["budget"].get("limit_chars")
     if cursor is not None:
         out["delta"]["cursor_advanced"] = _can_advance(result)
@@ -408,6 +448,10 @@ def finalize_context(corpus, result, *, view="compact", cursor=None, refresh=Fal
                           "omitted_units": result["budget"].get("omitted_units", 0) + discarded}}
         if cursor is not None:
             out["delta"] = {"cursor_advanced": False}
+        if "task_core" in result or view == "compact":
+            trial = {**out, "budget": dict(out["budget"]), "task_core": task_core(corpus, result)}
+            if _measure(trial) <= limit:
+                out = trial
         _measure(out)
         return out
     _measure(out)

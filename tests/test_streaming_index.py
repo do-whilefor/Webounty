@@ -156,7 +156,7 @@ class StreamingIndexTests(unittest.TestCase):
                   ]})
         result = self.add({"records": [{"id": "F", "summary": "Handle conditions require a new review",
                     "change_reason": "Current source interpretation changed."}]})
-        self.assertEqual(set(result["needs_review_record_ids"]), {"CAP", "FIND"})
+        self.assertEqual(set(result["needs_review_record_ids"]), {"CAP", "FIND", "USE"})
         corpus = self.corpus()
         self.assertEqual(corpus.records["CAP"]["status"], "needs_review")
         self.assertEqual(corpus.records["FIND"]["status"], "needs_review")

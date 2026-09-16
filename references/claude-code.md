@@ -15,11 +15,13 @@
 - start 在当前工作目录下创建 `.webounty/<会话ID的SHA-256>/`；`--project-root PATH` 可指定项目目录。路径以返回的 project_root/root 为准，不自动向上查找 Git 根目录。
 - 同一项目和会话复用工作区；不同项目或不同会话分别隔离。session.json 登记项目归属，后续命令按 root 定位，切换工作目录不改变已创建会话的位置。
 - 工作区属于整个研究会话，多个发现、Step、查询和子任务共享。start 重复调用不改写已有目标。
-- 上下文压缩后保留 session_id/root/run_id；同一 context 游标加 --refresh 重发当前问题的完整视图，按 ID 补读当前 Goal 和活动 Step，再继续 discover。
+- 上下文压缩后保留 session_id/root/run_id；宿主能维护上下文代次时给同一 context 游标传新的 --context-epoch，不能维护时加 --refresh 重发当前问题的完整视图。task_core 每次保留目标与硬约束；按 ID 补读活动 Step，再继续 discover。脚本不自动检测压缩。
 - 目录已清理则原证据不可恢复；新会话不自动加载其他会话数据。
 - finish 只删除归属匹配的会话子目录，项目、`.webounty/` 中其他会话和原始用户文件保持不变。需要导出时使用本会话目录之外的新目录。
 - 本包不安装 hook 或修改客户端配置。普通回复结束不是会话结束；异常退出可能在项目下残留会话资料。
 - 将来若接宿主自动清理，应处理真实会话结束。Claude Code 的 Stop 是一次回复结束，不能用于清理本轮知识。
+
+恢复调用仍需 query、anchor 或 question-ref 之一。暂时只记得 root/run_id 时，可用 `context --root '本轮root' --run-id '本轮run_id' --anchor G-001 --cursor main --context-epoch E2` 先恢复目标，再从 goals[].active_question_ref 按 ID 补读当前问题。query 为空且没有任何定位条件会报错，不会自动猜测上一问题。
 
 ## 命令
 
@@ -27,11 +29,11 @@
 
 | 命令 | 用途 |
 |---|---|
-| start | 创建或复用会话 |
+| start | 创建或复用会话；可重复 --constraint 保存用户硬约束 |
 | record | 提交观察、记录和 Wiki，同步词法索引并返回相关连接与待复核判断 |
-| context | 默认返回紧凑知识与来源引用；--cursor 跨轮差量，--refresh 恢复当前视图 |
+| context | 紧凑知识、task_core 与来源引用；--cursor 跨轮差量，--context-epoch / --refresh 恢复当前视图 |
 | discover | 全会话能力供需检索、候选路径、多输入组合与表达复核 |
-| read | 按 ID 读取资料；工件可用 --offset / --length 精读原文字节范围 |
+| read | 按 ID 读取资料；--pointer 精读观察 JSON 字段，--offset / --length 读取工件字节范围 |
 | compare | 并列比较两份已存观察的条件、响应和业务字段 |
 | methods | 读取固定方法，不创建会话 |
 | audit | 检查存储和引用 |
@@ -39,6 +41,10 @@
 | finish | 明确收尾；可显式导出快照 |
 
 辅助脚本不扫描网络或执行攻击。实际取证沿用宿主工具及当前任务授权。
+
+context/read/discover 均支持 --current-conditions 传入已知执行条件，值为 JSON 字符串对象。仅作本次资料适用性检查，不探测目标、不改变既有观察。
+
+更新此包时替换完整技能目录，保留项目内当前研究的 .webounty 目录；不要把运行中的证据混入技能包。旧状态可读取，缓存自动按需重建，旧游标首次使用会重新交付。
 
 ## 本地检查
 

@@ -10,6 +10,8 @@ from collections import defaultdict
 import heapq
 import json
 
+from conditions import known as _known
+
 
 def _key(edge):
     return (edge["consumer_ref"], edge["need_index"],
@@ -81,10 +83,6 @@ def _provide_values(records, edge):
     spec = records[edge["producer_ref"]]["capability"]["provides"][edge["provide_index"]]
     return _values(edge["producer_ref"], "provide", edge["provide_index"],
                    spec.get("constraints", {}))
-
-
-def _known(value):
-    return value is not None and value != ""
 
 
 def _canonical(value):

@@ -62,7 +62,7 @@ def log(root, action, **metadata):
         stream.write(json.dumps(event, ensure_ascii=False) + "\n")
 
 
-def start(session_id, question, project_root=None):
+def start(session_id, question, project_root=None, hard_constraints=()):
     if not question.strip():
         raise ValueError("question cannot be empty")
     project = Path(project_root if project_root is not None else Path.cwd()).resolve(strict=True)
@@ -82,7 +82,7 @@ def start(session_id, question, project_root=None):
                  "session_id": session_id, "run_id": "WB-" + uuid.uuid4().hex}
         state = {"run_id": owner["run_id"], "session_id": session_id, "revision": 1,
                  "records": {"G-001": {"id": "G-001", "kind": "Goal", "revision": 1,
-                                         "status": "active", "summary": question,
+                                         "status": "active", "summary": question, "hard_constraints": list(hard_constraints),
                                          "subject_refs": [], "observation_refs": []}},
                  "entities": {}, "observations": {}, "artifacts": {}}
         (root / "session.json").write_text(dump(owner), encoding="utf-8")
@@ -112,7 +112,11 @@ def finish(root, run_id, session_id, export=None):
             "export": str(output) if output else None}
 
 
-def read_ids(corpus, identifiers, *, offset=None, length=None):
+def read_ids(corpus, identifiers, *, offset=None, length=None, pointer=None):
+    if pointer is not None and (offset is not None or length is not None):
+        raise ValueError("pointer and byte range reads are separate selectors")
+    if pointer is not None and any(identifier not in corpus.observations for identifier in identifiers):
+        raise ValueError("JSON Pointer reads address observation IDs")
     if (offset is None) != (length is None):
         raise ValueError("range reads require both --offset and --length")
     if offset is not None and any(identifier not in corpus.artifacts for identifier in identifiers):
@@ -135,8 +139,13 @@ def read_ids(corpus, identifiers, *, offset=None, length=None):
                                         for block in corpus.pages[identifier]["blocks"])
         else:
             raise ValueError("unknown ID: " + identifier)
-    package, issues = corpus.package(**wanted)
+    package, issues = corpus.package(**wanted, view="compact" if pointer is not None else "evidence")
     if package is not None:
+        if pointer is not None:
+            from excerpts import json_excerpt
+            for row in package["observations"]:
+                if row["id"] in identifiers and row["status"] == "ready":
+                    row["excerpts"] = [json_excerpt(corpus.observation(row["id"]), pointer)]
         artifacts = {row["id"]: row for row in package["artifacts"]}
         for aid in artifact_ids:
             if offset is not None:
@@ -168,11 +177,14 @@ def parser():
     cmd = sub.add_parser("start", help="Create or reuse this conversation's Wiki")
     cmd.add_argument("--session-id", required=True)
     cmd.add_argument("--question", required=True)
+    cmd.add_argument("--constraint", action="append", default=[], help="Verbatim user constraint; repeatable")
     cmd.add_argument("--project-root", help="Project directory for .webounty; defaults to the current directory")
     for name in ("record", "context", "discover", "read", "compare", "audit", "finish", "wiki"):
         cmd = sub.add_parser(name)
         cmd.add_argument("--root", required=True)
         cmd.add_argument("--run-id", required=True)
+        if name in {"context", "discover", "read"}:
+            cmd.add_argument("--current-conditions", type=json.loads, help="Current execution context as a JSON object")
         if name == "record":
             cmd.add_argument("--input", required=True, help="JSON batch file, or - for stdin")
         elif name == "context":
@@ -189,6 +201,7 @@ def parser():
             cmd.add_argument("--view", choices=("compact", "evidence"), default="compact")
             cmd.add_argument("--cursor", help="Reuse a conversation reader cursor to return changes")
             cmd.add_argument("--refresh", action="store_true", help="Resend current context after compaction")
+            cmd.add_argument("--context-epoch", help="Host context generation; a change resets this cursor")
         elif name == "discover":
             cmd.add_argument("--query", default="")
             cmd.add_argument("--anchor", action="append", default=[])
@@ -197,6 +210,7 @@ def parser():
             cmd.add_argument("--id", action="append", required=True)
             cmd.add_argument("--offset", type=int, help="Byte offset in an original artifact")
             cmd.add_argument("--length", type=int, help="Number of original bytes to read")
+            cmd.add_argument("--pointer", help="JSON Pointer within an original observation")
         elif name == "compare":
             cmd.add_argument("--left", required=True, help="First stored observation ID")
             cmd.add_argument("--right", required=True, help="Second stored observation ID")
@@ -218,7 +232,7 @@ def parser():
 def dispatch(args, *, metrics=None):
     metrics = {} if metrics is None else metrics
     if args.command == "start":
-        return start(args.session_id, args.question, args.project_root)
+        return start(args.session_id, args.question, args.project_root, args.constraint)
     if args.command == "methods":
         from methods import select_methods
         cards, issues = select_methods(args.query, args.method_id, intents=args.intent)
@@ -252,7 +266,8 @@ def dispatch(args, *, metrics=None):
                           include_methods=not args.no_methods, method_ids=args.method_id,
                           method_intents=args.method_intent, cross_limit=args.cross_limit,
                           view=args.view, cursor=args.cursor, refresh=args.refresh, metrics=metrics,
-                          mode=args.mode, question_ref=args.question_ref)
+                          mode=args.mode, question_ref=args.question_ref, context_epoch=args.context_epoch,
+                          current_conditions=args.current_conditions)
         log(root, "context", state_revision=result["state_revision"], anchors=args.anchor,
             elapsed_ms=round((perf_counter() - started) * 1000, 3),
             view=args.view, mode=args.mode, question_ref=args.question_ref, output_chars=result["budget"]["used_chars"], metrics=metrics)
@@ -260,7 +275,8 @@ def dispatch(args, *, metrics=None):
     if args.command == "discover":
         from rag import Corpus
         from discovery import discover
-        with Corpus(root, args.run_id, lazy_pages=True, lazy_metadata=True, metrics=metrics) as corpus:
+        with Corpus(root, args.run_id, lazy_pages=True, lazy_metadata=True, metrics=metrics,
+                    current_conditions=args.current_conditions) as corpus:
             with measure(metrics, "discovery"):
                 result = discover(corpus, args.query, args.anchor, args.changed)
             if not corpus.stable():
@@ -271,8 +287,9 @@ def dispatch(args, *, metrics=None):
     if args.command == "read":
         from rag import Corpus
         count(metrics, "read_calls")
-        with Corpus(root, args.run_id, lazy_pages=True, lazy_metadata=True, metrics=metrics) as corpus:
-            result = read_ids(corpus, args.id, offset=args.offset, length=args.length)
+        with Corpus(root, args.run_id, lazy_pages=True, lazy_metadata=True, metrics=metrics,
+                    current_conditions=args.current_conditions) as corpus:
+            result = read_ids(corpus, args.id, offset=args.offset, length=args.length, pointer=args.pointer)
         log(root, "read", ids=args.id, metrics=metrics)
         return result
     if args.command == "compare":

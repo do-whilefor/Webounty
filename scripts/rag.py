@@ -107,8 +107,13 @@ class Corpus:
     CACHE_TOTAL_BYTES = 2 * 1024 * 1024
 
     @corpus_stage("load")
-    def __init__(self, root, run_id, *, lazy_pages=False, lazy_metadata=False, metrics=None):
+    def __init__(self, root, run_id, *, lazy_pages=False, lazy_metadata=False, metrics=None, current_conditions=None):
         self.metrics = metrics
+        if current_conditions is not None and (not isinstance(current_conditions, dict) or
+                any(not isinstance(key, str) or not isinstance(value, str) for key, value in current_conditions.items())):
+            raise RetrievalError("current_conditions must be an object of strings")
+        self.current_conditions = dict(current_conditions or {})
+        self.source_checker = None
         self.root = Path(root).resolve(strict=True)
         if not self.root.is_dir() or not run_id:
             raise RetrievalError("root 必须是本轮资料目录，run_id 不可为空")
@@ -455,6 +460,9 @@ class Corpus:
                               "path": self.artifacts.get(index["artifact_id"], {}).get("path"),
                               "line": index.get("line"), "content_hash": index["content_hash"]},
                 "issues": issues}
+        if out["status"] == "ready" and index.get("excerpt_selectors"):
+            from excerpts import observation_excerpts
+            out["excerpts"] = observation_excerpts(self, out)
         if oid in getattr(self, "retrieval_source_matches", {}):
             out["source_match"] = self.retrieval_source_matches[oid]
         if self.artifacts.get(index["artifact_id"], {}).get("bytes", 0) <= self.CACHE_FILE_BYTES:
@@ -685,8 +693,12 @@ class Corpus:
         if any(i["code"] in {"missing_reference", "history_without_correction", "dependency_cycle"} for i in issues):
             return None, issues
         artifact_ids = set()
+        if self.source_checker is None:
+            from discovery import _Sources
+            self.source_checker = _Sources(self)
         for rid in rids:
             row = self.records[rid]
+            issues.extend(self.source_checker.basis_issues(rid))
             if row.get("kind") == "Fact" and not (row.get("observation_refs") or row.get("artifact_refs") or row.get("source_refs")):
                 issues.append({"code": "fact_without_source", "id": rid})
             oids.update(row.get("observation_refs", []))
@@ -822,7 +834,7 @@ def cross_candidates(corpus, observations, limit):
 def retrieve(root, run_id, query, anchors=(), budget_chars=None, max_candidates=None,
              *, include_methods=False, method_ids=(), method_intents=(), cross_limit=0,
              view="evidence", cursor=None, refresh=False, metrics=None,
-             mode="combined", question_ref=None):
+             mode="combined", question_ref=None, context_epoch=None, current_conditions=None):
     anchors = list(anchors)
     if mode not in {"combined", "lexical"}:
         raise RetrievalError("mode must be combined or lexical")
@@ -838,28 +850,45 @@ def retrieve(root, run_id, query, anchors=(), budget_chars=None, max_candidates=
         raise RetrievalError("cross_limit 必须为非负整数；0 表示不运行观察两两对照")
     corpus = None
     try:
-        corpus = Corpus(root, run_id, lazy_pages=True, lazy_metadata=True, metrics=metrics)
+        corpus = Corpus(root, run_id, lazy_pages=True, lazy_metadata=True, metrics=metrics,
+                        current_conditions=current_conditions)
         if question_ref is not None and question_ref not in corpus.records:
             raise RetrievalError("question_ref must identify an existing session record")
         method_units, method_issues = (select_methods(query, method_ids, intents=method_intents)
                                       if include_methods or method_ids or method_intents else ([], []))
-        result = _retrieve(corpus, query, list(anchors), budget_chars, max_candidates,
-                           method_units, method_issues, cross_limit=cross_limit, related_only=view == "compact",
-                           view=view, mode=mode)
-        result["retrieval_request"] = {"mode": mode, "query": query, "anchors": sorted(set(anchors)),
-            "question_ref": question_ref, "max_candidates": max_candidates,
-            "cross_limit": cross_limit, "include_methods": include_methods,
-            "method_ids": sorted(method_ids), "method_intents": sorted(method_intents)}
-        if question_ref is not None:
-            from question_context import assess_question
-            result["question_context"] = assess_question(corpus, question_ref, result, mode=mode)
+        def build(pack_limit):
+            result = _retrieve(corpus, query, list(anchors), pack_limit, max_candidates,
+                               method_units, method_issues, cross_limit=cross_limit, related_only=view == "compact",
+                               view=view, mode=mode)
+            result["budget"]["limit_chars"] = budget_chars
+            result["retrieval_request"] = {"mode": mode, "query": query, "anchors": sorted(set(anchors)),
+                "question_ref": question_ref, "max_candidates": max_candidates,
+                "cross_limit": cross_limit, "include_methods": include_methods,
+                "method_ids": sorted(method_ids), "method_intents": sorted(method_intents),
+                "current_conditions": current_conditions or {}}
+            if question_ref is not None:
+                from question_context import assess_question
+                result["question_context"] = assess_question(corpus, question_ref, result, mode=mode)
             if not corpus.stable():
                 result = {"run_id": corpus.run_id, "state_revision": corpus.state["revision"],
                     "status": "unavailable", "gaps": [{"code": "snapshot_changed"}],
+                    "records": [], "observations": [], "artifacts": [], "blocks": [], "entities": [],
+                    "chain_discovery": {"candidates": [], "paths": [], "combinations": [], "type_reviews": []},
                     "budget": {"limit_chars": budget_chars, "used_chars": 0, "omitted_units": 0}}
-        from context_views import finalize_context
-        with stage_measure(metrics, "context_view"):
-            return finalize_context(corpus, result, view=view, cursor=cursor, refresh=refresh)
+            from context_views import finalize_context
+            with stage_measure(metrics, "context_view"):
+                return finalize_context(corpus, result, view=view, cursor=cursor, refresh=refresh,
+                                        context_epoch=context_epoch)
+
+        # First account for already-delivered bodies; verification still visits
+        # the full source closure. If new material exceeds the budget, use the
+        # existing whole-package selector once. Failed finalization saves no cursor.
+        result = build(None if cursor is not None else budget_chars)
+        if (cursor is not None and budget_chars is not None and result["status"] == "unavailable"
+                and any(gap["code"] == "budget_exhausted" for gap in result["gaps"])):
+            result = build(budget_chars)
+        return result
+
     except RetrievalError:
         raise
     except (OSError, KeyError, TypeError, AttributeError, UnicodeError, json.JSONDecodeError) as exc:
@@ -1242,6 +1271,8 @@ def main(argv=None, *, include_methods=False):
     parser.add_argument("--view", choices=("compact", "evidence"), default="compact")
     parser.add_argument("--cursor", help="本会话读取游标；重复使用以仅返回变化")
     parser.add_argument("--refresh", action="store_true", help="上下文压缩后重发当前查询完整视图")
+    parser.add_argument("--context-epoch", help="宿主上下文代次；变化时重置交付游标")
+    parser.add_argument("--current-conditions", type=json.loads, help="当前执行条件的 JSON 对象")
     args = parser.parse_args(argv)
     if args.no_methods and (args.method_id or args.method_intent):
         parser.error("--no-methods cannot be combined with --method-id or --method-intent")
@@ -1250,7 +1281,8 @@ def main(argv=None, *, include_methods=False):
                           include_methods=include_methods and not args.no_methods,
                           method_ids=args.method_id, method_intents=args.method_intent, cross_limit=args.cross_limit,
                           view=args.view, cursor=args.cursor, refresh=args.refresh,
-                          mode=args.mode, question_ref=args.question_ref)
+                          mode=args.mode, question_ref=args.question_ref, context_epoch=args.context_epoch,
+                          current_conditions=args.current_conditions)
     except RetrievalError as exc:
         print(encode({"error": str(exc)}), file=sys.stderr)
         return 2

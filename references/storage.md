@@ -45,7 +45,21 @@ record --input 接收 UTF-8 JSON 文件，或 `--input -` 从 stdin 读取。顶
 
 content 可保存 HTTP、日志、源码定位、用户输入等 JSON 对象，字段来自真实资料；上例为虚构格式。主体 ID 必须先登记或在同批 entities 中登记。没有主体时使用空数组，不编造。
 
+按实际已知信息保存 environment、actor_ref、session_generation、credential_generation、target_version、observed_at、trace_ref、truncated。会话代次和凭据代次是不同字段；trace_ref 是原始执行记录的定位说明，不会被脚本自动抓取。原件取得后先入库，再写 summary；工具端已经截断的输出不能通过摘要补成完整证据。
+
 source_path 可填写实际输入文件的绝对路径，脚本流式复制原件、计算哈希并登记来源；原路径不会删除。UTF-8 文本原件分段参与全文检索，二进制原件仅保存与验证。大响应、日志或源码文件优先从 source_path 导入，content 只写实际取得的请求、响应状态、环境等上下文字段；不要为缩短正文而编造摘要或条件。观察存为单独 JSONL，不允许重复覆盖 ID。证据更正用新观察和对应记录的更正关联表达。
+
+可选 excerpt_selectors 在提交观察时选择紧凑视图需要保真的原文：
+
+```json
+{
+  "id": "O-ERROR",
+  "content": {"response": {"status": 403, "body": {"error": "CSRF token mismatch", "allowed": false}}},
+  "excerpt_selectors": [{"pointer": "/response/body/error"}, {"pointer": "/response/body/allowed"}]
+}
+```
+
+pointer 使用 JSON Pointer，相对 content 定位，保留原值及类型，包括 false、0、null 和空字符串；它不是原始 JSON 排版字节。字节摘录使用 `{"offset":0,"length":64}`，相对 source_path 导入的文件，须与实际原件配合。选择范围应含必要条件或相邻解释。输出附 observation_ref、artifact_ref、source_sha256；字节范围另有 range_sha256。两类摘录都标为 independent_observation:false，不增加独立证据数量。已有观察不可改写选择器，用 read --pointer 或范围读取即可。
 
 ### 实体
 
@@ -53,12 +67,13 @@ source_path 可填写实际输入文件的绝对路径，脚本流式复制原�
 
 ### 研究记录
 
-共同字段：id、kind、status、summary、subject_refs、observation_refs。kind 可用 Goal、Fact、Step、Finding、Capability、Chain。其余字段按问题需要添加，如 title、conditions、limitations、reopen_when、change_reason、cvss。
+共同字段：id、kind、status、summary、subject_refs、observation_refs。kind 可用 Goal、Fact、Question、Step、Finding、Capability、Chain。其余字段按问题需要添加，如 title、conditions、limitations、reopen_when、change_reason、cvss。
 
 | 类型 | 推荐用途与状态 |
 |---|---|
 | Goal | 目标、范围、完成条件；active/completed/blocked |
 | Fact | 有条件的观察表述；observed |
+| Question | 待回答问题与缺口；open/resolved/blocked |
 | Step | 假设、缺口、下一验证；active/blocked/done |
 | Finding | 候选漏洞及影响；candidate/verified/refuted/needs_review |
 | Capability | 可供组合的能力与必要条件；observed/candidate/verified/refuted/needs_review |
@@ -70,9 +85,15 @@ capability.provides / capability.needs 是能力供需，不要混用记录级 r
 
 更新同一 ID 时，传入字段覆盖该字段，未传字段保留；嵌套对象和数组按整体替换，所以修改 capability 或 observation_refs 时传完整新值。用 change_reason 简要说明更正原因。脚本维护修订，不提供版本回滚。
 
+Goal 可保存 hard_constraints（用户约束原文的字符串数组）、scope、active_question_ref、next_action；Question/Step 也可声明 next_action。start --constraint 可重复传入，重复 start 不覆盖已存目标或约束。task_core 每次从这些字段派生，不新建一份黑板文件，也不自动编造下一步。
+
+顶层 conditions 保存此判断适用的共同执行条件，例如 `{"environment":"lab-v1","session_generation":"2","credential_generation":"3"}`。context/read/discover 的 --current-conditions 只检查本次显式传入的轴，值为字符串；缺少或未知返回 current_condition_unknown，不同返回 current_condition_conflict。它不修改存储状态、不自动探测环境。能力 provides/needs 中的 constraints 描述产物或输入，可合法指向其他身份，不被用作当前执行身份的替代。
+
 修订时自动保存简短 history 条目，用于说明旧判断为何变化；其 record_refs / observation_refs 是历史定位，不加入当前必需证据。首页分区、发现详情、负结果和修订区的写法见 [Wiki 组织](wiki-layout.md)。
 
-新反证可单独建记录并设 contradicts:[旧记录ID]。旧记录需要被修正时同时更新其 status 和关联；不要删除旧原件。来源、主体条件或反证变化会沿依赖反查传播，未在本批显式复核的 Capability、Finding、Chain 转为 needs_review。record 用 needs_review_record_ids 返回这些判断，并保留 needs_review_chain_ids。原始观察和历史 Fact 不因此被否定；页面提示待复核，Claude 读取证据后显式修订判断。
+新反证可单独建记录并设 contradicts:[旧记录ID]。旧记录需要被修正时同时更新其 status 和关联；不要删除旧原件。来源、主体条件或反证变化沿依赖传播，未在本批显式更新的 Capability、Finding、Chain 转为 needs_review，并带 basis_status:needs_review；Fact、Question、Step 只标记 basis_status，保留历史或工作流 status。record 用 needs_review_record_ids 返回这些判断，并保留 needs_review_chain_ids。原始观察不因此被否定，read/context/discover 统一提示依据问题。
+
+已有 basis_status:needs_review 不会因普通字段更新解除。复核后提交 reviewed:true、change_reason，并重新绑定当前 source_refs 的 revision、更新必要的 observation_refs；Capability/Finding/Chain 同时设置合适的 status。reviewed 是提交指令，不写入存储。来源仍过期、缺失或上游待复核时拒绝解除；它检查引用，不证明作者的复核结论正确。保留真实反证关系，不为清除提示而删除反证。
 
 曾取得的能力后来撤销或过期时，保留历史取得观察，新增当前失效观察，并修订该能力的当前可用性。摘要与 change_reason 说明反证针对的是“现在仍可使用”，不否定过去确实取得；尚未确认失效时保留待复核状态。
 
@@ -156,6 +177,7 @@ provide_index 和 need_index 从 0 开始。连接 assessment 为 candidate/veri
 ```bash
 python3 scripts/session.py read --root '本轮root' --run-id '本轮run_id' --id C-001 --id WK-FLOW
 python3 scripts/session.py read --root '本轮root' --run-id '本轮run_id' --id SRC-O-001 --offset 0 --length 65536
+python3 scripts/session.py read --root '本轮root' --run-id '本轮run_id' --id O-ERROR --pointer /response/body/error
 python3 scripts/session.py audit --root '本轮root' --run-id '本轮run_id'
 ```
 

@@ -27,7 +27,7 @@ question-ref 必须是当前会话已有的记录 ID，自动加入 anchor，可
 | source_observation_refs | 沿该记录已声明的来源关系找到、可读取的观察；其中可能包含前提或历史依据，不表示直接证明了答案 |
 | source_issues | 来源缺失、旧修订、待复核状态、显式更正等诊断 |
 | competing_record_refs | 指向竞争判断或更正的精读入口，不自动接受其中任何一方 |
-| declared_conditions | 问题记录声明的条件；与当前执行环境是否一致由 Claude 核对 |
+| declared_conditions | 问题记录声明的条件；传入 --current-conditions 时检查对应轴，其他适用性仍由宿主核对 |
 | requirements.status | not_declared、not_checked、unresolved 或 candidate_complete |
 | requirements.missing_preconditions | 代表方案中尚未覆盖的输入，含上游输入、条件和候选引用 |
 | next_actions | 精读、检查前提或针对缺口检索的建议；query 缺省时由 Claude 根据具体缺口填写 |
@@ -37,6 +37,8 @@ needs 未填写时返回 not_declared；词法模式没有检查 needs 时返回
 
 若返回包不可用、存在材料遗漏或问题记录未被返回，检查报告明确标为 question_context_incomplete，不把截断后的空列表解释成没有前提或证据。报告本身参与显式字符预算；装不下时返回 budget_exhausted，不推进 cursor。
 
+同一个 cursor 的 task_core 每次保留目标与硬约束；来源诊断也不会因记录正文进入 unchanged_refs 而消失。上游改动可使旧 Fact/Question/Step 的 basis_status 成为 needs_review，即使其作者 status 仍是 verified、open 或 done，也须先处理来源问题。unknown 与 unknown 不能构成 candidate_complete。
+
 ## 缺口驱动的下一步
 
 示例：问题是“先前失败的报表读取能否继续”。
@@ -45,6 +47,8 @@ needs 未填写时返回 not_declared；词法模式没有检查 needs 时返回
 2. 精读已有观察。创建任务成功只能说明获得了任务，不说明下载成功。
 3. 对未解决输入单独检索，例如“哪个已观察步骤提供下载授权”。已知输入对应记录时用 discover 的 anchor，不重复泛搜同一漏洞名称。
 4. 找到候选后读双方原件并核对条件。若需要新实验才能判断，就取得新观察，再 record 更新原问题及其依据。
+
+旧失败的 reopen_when、未决输入和业务字段可成为下一次查询的具体词。环境、会话或凭据改变时显式传入当前已知条件，避免把原先受阻/成功的观察直接套用到新环境。恢复压缩后的上下文时更新 --context-epoch 或使用 --refresh，再开始判断。
 
 只有在资料确实回答问题、反证得到处理且适用条件被核实时，Claude 才形成相应结论。脚本不会自动提交 verified，也不将派生报告另存为原始证据。
 

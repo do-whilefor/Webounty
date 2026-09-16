@@ -113,7 +113,7 @@ class ContextViewsTests(unittest.TestCase):
         self.assertEqual(change["ancestry"], ["Updated reports", "Download checks"])
         self.assertNotIn("text", change)
 
-    def test_new_counterevidence_retransmits_affected_judgment_without_own_revision_change(self):
+    def test_new_counterevidence_marks_question_basis_and_retransmits_judgment(self):
         self.output(cursor="c")
         state = json.loads((self.root / "state.json").read_text())
         old_revision = state["records"]["R"]["revision"]
@@ -122,8 +122,10 @@ class ContextViewsTests(unittest.TestCase):
         second = self.output(cursor="c")
         self.assertIn("NEG", {row["id"] for row in second["records"]})
         record = next(row for row in second["records"] if row["id"] == "R")
-        self.assertEqual(record["revision"], old_revision)
-        self.assertIn({"kind": "record", "id": "R", "change": "dependencies"}, second["delta"]["changes"])
+        self.assertEqual(record["revision"], old_revision + 1)
+        self.assertEqual(record["status"], "open")
+        self.assertEqual(record["basis_status"], "needs_review")
+        self.assertIn({"kind": "record", "id": "R", "change": "content"}, second["delta"]["changes"])
 
     def test_refresh_resets_old_nonmatching_deliveries(self):
         self.output(anchors=("OTHER",), cursor="c")

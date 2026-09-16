@@ -19,8 +19,10 @@ Claude Code 在技能正文中替换 `${CLAUDE_SKILL_DIR}` 和 `${CLAUDE_SESSION
 
 ```bash
 python3 "${CLAUDE_SKILL_DIR}/scripts/session.py" start \
-  --session-id "${CLAUDE_SESSION_ID}" --question '当前研究目标与完成条件'
+ --session-id "${CLAUDE_SESSION_ID}" --question '当前研究目标与完成条件'
 ```
+
+有用户硬约束时，用可重复的 `--constraint '用户约束原文'` 保存到 Goal.hard_constraints；不要替用户补造限制。后续通过 record 更新 Goal 的范围、约束、active_question_ref 和 next_action。
 
 记住返回的 `project_root/root/run_id/session_id`，后续显式传本轮 root/run_id，即使切换工作目录也沿用。相同项目、相同会话重复 start 复用目录，不替换目标；改变目标时更新 Goal，子问题写成 Step，共享已有知识。
 
@@ -50,7 +52,11 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/session.py" context \
 
 大型原件通过 observation 的 `source_path` 导入，content 保留实际观察的上下文字段。UTF-8 原文参与检索；命中的 observation 可带 `source_match`，按其 artifact_id、offset、length 用 `read --id ID --offset N --length N` 读取对应原件片段。它只定位一个相关窗口，不是完整结论或新证据；必要时继续读取相邻内容，不能遗漏条件或反证。
 
-同一上下文沿用 cursor，先读变化项、gaps 和 chain_discovery；combination_changes 指出具体组合哪些输入发生变化，retired_refs 表示本次重查后不再适用的旧派生提示。unchanged_refs 只表示该游标曾返回相同资料，不表示重新验证或无需阅读。上下文压缩、丢失前文或更换执行者后，加 `--refresh` 重发当前问题的完整视图。首次使用或省略 cursor 会返回完整视图。先处理来源变更、反证和待复核项。
+错误原文、关键字段和代码片段可在观察中用 excerpt_selectors 指定，随紧凑视图返回；已有观察用 `read --id O-001 --pointer /response/body/error` 按 JSON Pointer 精读，值相对提交的 content 定位。摘录保留来源和哈希，不能当作另一份独立观察。
+
+同一上下文沿用 cursor，先读 task_core、变化项、gaps 和 chain_discovery。task_core 每次重发当前 Goal、硬约束、当前问题和已声明的下一步，直接从现有状态派生。combination_changes 指出组合输入的变化，retired_refs 表示本次重查后不再适用的旧提示。unchanged_refs 仅表示曾向该游标交付相同资料，不表示重新验证或宿主仍记得。
+
+宿主能维护上下文代次时，每次传 `--context-epoch '当前代次'`，压缩或丢失前文后更换代次，脚本会重发当前问题的完整视图；代次必须由宿主维护，脚本不自动检测压缩。无法维护代次时，恢复后显式加 `--refresh`。不同执行者使用不同 cursor。首次使用或省略 cursor 返回完整视图；先处理来源变更、反证和待复核项。
 
 removed_refs 表示当前完整清单确认某个已交付 Wiki 块被移除，应撤下其旧视图；换查询没有命中不算删除。
 
@@ -59,6 +65,8 @@ removed_refs 表示当前完整清单确认某个已交付 Wiki 块被移除，�
 只针对尚未解决的具体缺口补检索。`retrieval_progress.recommendation: stop_repeating_query` 表示同一 cursor 曾收到相同请求和当前资料，不代表已经回答或资料不存在；停止原样重复，改为精读、改写缺口查询，或在现有材料无法补齐时取得新观察。证据已经足够时直接回答；缺的是实验结果时停止搜索现有 Wiki。不要把简单重试或循环次数当作证据充分标准。
 
 查询应说明谁能提供缺失输入、谁消费新产物、正常基线在哪里、哪项反证可能改变判断；不要只搜索漏洞名称。见 [检索与链路组合](references/retrieval.md)。
+
+多词查询过滤常见虚词，原件仍完整索引；路径、否定词和引号中的词保留。查旧失败时把 reopen_when 中的具体条件写入查询，查缺口时写提供者或 capability.needs；无有效命中就改写具体缺口，不依赖隐式语义理解。默认不设固定 Top-K 或字符上限；需要控制本次交付时用 --budget-chars / --max-candidates，检查遗漏并按 ID 补读。
 
 ## 保存值得复用的知识
 
@@ -76,6 +84,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/session.py" record \
 - 同一知识对象保持稳定 ID；更新记录时说明更正原因，关联支持与反证。原始观察另存新 ID。
 - 能力写清 capability.provides、capability.needs、控制范围和条件。正常业务步骤也可提供能力，不仅保存高分漏洞。
 - 原始内容来自实际输入或工具输出，不为满足字段补造观察、身份、版本和结果。
+- 工具输出先保存原文或 source_path，再写解释。工具已截断时如实记录 truncated，保存可用的 trace_ref/observed_at；只拿到截断片段时不能声称存下完整输出。
 - 状态修订、页面、清单、哈希和定位由提交入口同步生成，不手动维护多份副本。
 - 同一研究会话只由一个执行者提交。处理当前研究的 Agent 可直接调用 record，无需为本地提交额外确认；同会话的并行子任务把结果交给该执行者。
 
@@ -85,7 +94,7 @@ record 正常返回时，本次词法索引已经更新。判断或目录变更�
 
 查询复用本会话的条目元数据和供需关系索引，按 ID 读取所需判断及来源。缓存缺失或状态文件被外部修改时从当前资料重建，仍校验命中的页面与原件。已知 ID 时直接 read；要补齐其关系时可用空 query 配合 anchor，避免无关词法查询。
 
-needs_review_record_ids 列出来源变化后待复核的能力、发现与链；它们保留历史依据，当前可用性须重新判断。确认新依据后显式修订，不把重建索引当作复核完成。
+needs_review_record_ids 也覆盖有依赖的 Fact、Question、Step；basis_status 与作者的工作流状态分开，旧状态为 verified 也可能需要复核。read、context、discover 均检查依据修订。确认新依据后重新绑定来源，以 `reviewed:true` 和 change_reason 显式提交复核；能力、发现与链还需明确更新其 status。不把改名、重建索引或再次读取当作完成复核。
 
 ## 在新能力与阻塞点检查组合
 
@@ -99,6 +108,8 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/session.py" discover \
 
 脚本在整个会话查找供需关系，不限于当前返回包。向前找消费者，向后找前提提供者。核对身份、对象范围、用途、环境、时效和所有必要输入，再按最有区分力的缺口选择验证。
 
+unknown、unspecified、not_recorded、未知、未记录及空值均不是已知条件，两端都未知不能视为匹配。环境或凭据改变后，可在 context/read/discover 传 `--current-conditions '{"environment":"当前环境","session_generation":"当前会话代次"}'`，只填实际已知值。它与记录顶层 conditions 比较，冲突或未声明均提示复核，不从能力产物的身份条件猜测当前执行身份。session_generation 与 credential_generation 分别记录，不混用；具体字段见存储说明。
+
 优先检查 combinations：同一消费者的多个必需输入按 AND 汇合，每个输入保留 OR 备选。plan 递归检查选中分支的前提、共同条件和反证，inputs 的局部覆盖不代表整个组合完整。脚本选择一个代表方案；它有缺口时继续检查 alternatives，不把当前方案失败当作全部组合失败，也不为并行提供者编造先后依赖。
 
 type_reviews 区分“没有完整类型/别名匹配”和“现有匹配全部失效或冲突，复核替代能力”。suggestions 只是词面相近的待读引用，用 `read --id` 查看双方原记录；确认真正同义后才修订 type/aliases，否则继续找能力。它不自动添加别名或连接，也不具备任意语义理解。
@@ -110,6 +121,8 @@ type_reviews 区分“没有完整类型/别名匹配”和“现有匹配全部
 ## 验证与更正
 
 执行前说明问题、关键前提、预期结果和可推翻它的信号。执行后保存原始结果再更新判断。HTTP 200、任务 ID、工具退出成功或取得字符串，不能替代业务成功与影响。
+
+脚本对原件哈希和声明条件的检查仅验证已有资料，不能证明当前环境仍然如此。是否补充现场验证，由宿主按现有授权和具体缺口决定；读取 Wiki 不触发额外网络请求。404 只描述该次请求的响应，不能单独证明接口不存在。
 
 区分未复现、反证与无法判断。失败记录保留适用条件和重开条件；新能力补齐旧缺口时重新评估。记录变更后检查受影响页面和 Chain，按新来源重新判断。
 

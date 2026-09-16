@@ -13,7 +13,7 @@ import json
 import sqlite3
 
 
-FORMAT_VERSION = "2"
+FORMAT_VERSION = "3"
 
 
 def _encode(value):

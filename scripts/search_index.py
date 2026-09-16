@@ -18,7 +18,7 @@ _MARKDOWN_LINK = re.compile(r"\[([^\]]+)\]\(([^\n)]*)\)")
 
 _BOOKKEEPING = frozenset({
     "id", "observation_id", "run_id", "revision", "kind", "fixture",
-    "status", "classification", "provenance", "issues", "index",
+    "basis_status", "status", "classification", "provenance", "issues", "index",
     "content_hash", "sha256", "hash", "bytes", "line", "artifact_id",
     "sealed", "observed_at", "created_at", "updated_at", "timestamp",
     "history", "requires", "contradicted_by", "corrected_by",
@@ -30,7 +30,7 @@ _BOOKKEEPING = frozenset({
 _WEIGHTS = {
     "title": 3.0, "aliases": 2.5, "summary": 2.0,
     "questions": 2.0, "keywords": 2.2, "body": 1.0, "knowledge": 0.5, "page": 0.25,
-    "navigation": 0.8, "source": 1.0,
+    "navigation": 0.8, "source": 1.0, "reopen_when": 2.0, "requirements": 1.5,
 }
 
 
@@ -67,6 +67,23 @@ def _terms(value):
             if len(components) > 1:
                 for component in components:
                     yield from _PARTS.findall(component.casefold())
+
+
+# Only query expansion drops ordinary function words. Original evidence remains
+# fully indexed; single-token and explicitly quoted searches preserve literals.
+_QUERY_NOISE = frozenset("a an the is are was were be been being of for to from with in on at by as and or this that these those it its what which who when where why how did does do can could would should please find show tell me about 是否 什么 如何 可以 这个 这些 请问".split())
+
+
+def query_terms(query, tokenize=_terms):
+    terms = set(tokenize(query))
+    if len(terms) <= 1:
+        return terms
+    literal = set()
+    for value in re.findall(r'"([^"\n]+)"|`([^`\n]+)`', query):
+        literal.update(tokenize(next(part for part in value if part)))
+    for path in re.findall(r'(?<!\w)/[A-Za-z0-9_./-]+', query):
+        literal.update(tokenize(path))
+    return (terms - _QUERY_NOISE) | literal
 
 
 def _refs(value):
@@ -197,14 +214,19 @@ def _fields(kind, row, corpus):
             # source/knowledge caches within its snapshot; this index keeps none.
             package, issues = corpus.package(
                 block_keys=[row["page_id"] + "/" + row["block_id"]], _expand_artifacts=False)
-            if package is not None and all(issue.get("code") == "reasoning_review_required"
-                                           for issue in issues):
+            if package is not None and all(issue.get("code") in {
+                    "reasoning_review_required", "current_condition_conflict", "current_condition_unknown"}
+                    for issue in issues):
                 # Missing premises remain relevant prose, never proof. Invalid
                 # references, shapes or underlying sources cannot affect ranking.
                 result["knowledge"] = knowledge
         return result
     result = {name: _text(row.get(name, ""))
               for name in ("title", "aliases", "summary", "questions", "keywords")}
+    if kind == "record":
+        result["reopen_when"] = _text(row.get("reopen_when", ""))
+        result["requirements"] = _text([row.get("blockers", []), row.get("unresolved_preconditions", []),
+                                         row.get("capability", {}).get("needs", [])], keys=True)
     body = {key: value for key, value in row.items()
             if key not in _BOOKKEEPING and key not in result
             and not key.startswith("_") and not key.endswith(("_refs", "_ref"))}
@@ -294,7 +316,7 @@ def rank(corpus, query, anchors, *, with_exact=False, with_reasons=False):
                     if may_occur(identifier):
                         identifiers[identifier].add(key)
 
-    terms = set(_terms(query))
+    terms = query_terms(query)
     if terms and hasattr(corpus, "root"):
         from retrieval_index import lexical_projection
         postings, field_lengths, averages, roles, unavailable = lexical_projection(
@@ -424,6 +446,16 @@ def rank(corpus, query, anchors, *, with_exact=False, with_reasons=False):
             continue
         if key in unavailable or block.get("_issues") or getattr(corpus, "page_issues", {}).get(block["page_id"]):
             continue
+        # Generated pages mirror a record, not a second independent judgment.
+        # Let their searchable prose locate that record without summing copies.
+        owners = _refs(block.get("source_refs", []))
+        if block.get("representation") == "record" and len(owners) == 1 and key in scores:
+            owner = next(iter(owners))
+            sources_current = all(not isinstance(ref, dict) or
+                                  ref.get("revision") == corpus.records[ref["id"]].get("revision")
+                                  for ref in block.get("source_refs", []))
+            if ("record", owner) in scores and sources_current:
+                scores[("record", owner)] = max(scores[("record", owner)], scores[key])
         page = corpus.pages[block["page_id"]]
         direct = bool(exact_ids & _refs(block.get("source_refs", [])))
         scoped = bool(subjects & _refs(block.get("subject_refs", page.get("subject_refs", []))))
@@ -431,7 +463,7 @@ def rank(corpus, query, anchors, *, with_exact=False, with_reasons=False):
             priorities[key] = 2 if direct else 1
             relation_reasons[key] = "source_relation" if direct else "subject_relation"
     ranked = sorted(scores.keys() | priorities.keys(),
-                    key=lambda key: (-priorities.get(key, 0), -scores.get(key, 0), key))
+                    key=lambda key: (-priorities.get(key, 0), -scores.get(key, 0), key[0] != "record", key))
     result = (ranked, issues, exact) if with_exact else (ranked, issues)
     if with_reasons:
         reasons = {}

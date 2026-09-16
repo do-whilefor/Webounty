@@ -13,6 +13,9 @@ import json
 import re
 import unicodedata
 
+from conditions import check as check_conditions
+from search_index import query_terms
+
 
 UNUSABLE = frozenset({
     "refuted", "corrected", "superseded", "stale", "withdrawn", "rejected",
@@ -76,22 +79,48 @@ class _Sources:
             for ref in _refs(row.get("contradicts", [])):
                 self.reverse[ref].add(rid)
 
+    def basis_issues(self, rid):
+        """The same local-basis diagnostics are used by read, context and discovery."""
+        row = self.corpus.records[rid]
+        issues = []
+        if row.get("basis_status") == "needs_review" or row.get("status") in {"needs_review", "review_required"}:
+            issues.append({"code": "basis_review_required", "record_id": rid})
+        corrections = set(self.reverse[rid])
+        for key in CORRECTIONS:
+            corrections.update(_refs(row.get(key, [])))
+        if corrections:
+            issues.append({"code": "record_has_correction", "record_id": rid, "record_refs": sorted(corrections)})
+        for source in _support_refs(row):
+            sid = source if isinstance(source, str) else source["id"]
+            linked = self.corpus.records.get(sid)
+            if linked is None:
+                issues.append({"code": "missing_source_record", "record_id": rid, "source_id": sid})
+            elif isinstance(source, dict) and source.get("revision", linked.get("revision")) != linked.get("revision"):
+                issues.append({"code": "stale_source", "record_id": rid, "source_id": sid,
+                               "expected": source["revision"], "current": linked.get("revision")})
+        current = getattr(self.corpus, "current_conditions", {})
+        if current and (row.get("conditions") or row.get("capability") or row.get("observation_refs") or _support_refs(row)):
+            declared = dict(row.get("conditions", {}))
+            # Only an explicitly declared common execution context is compared.
+            # Capability input/output constraints can legitimately describe other actors.
+            conflicts, unknown = check_conditions(
+                {key: declared[key] for key in current if key in declared}, current)
+            for item in conflicts:
+                issues.append({"code": "current_condition_conflict", "record_id": rid, **item})
+            for item in unknown:
+                issues.append({"code": "current_condition_unknown", "record_id": rid, **item})
+        return issues
+
     def inspect(self, rid, trail=()):
         if rid in self.cache:
             return self.cache[rid]
         if rid in trail:
             return {"observations": set(), "issues": [{"code": "source_cycle", "record_id": rid}], "usable": False}
         row = self.corpus.records[rid]
-        issues, observations = [], set()
-        usable = True
+        issues, observations = self.basis_issues(rid), set()
+        usable = not issues
         if row.get("status", "").casefold() in UNUSABLE:
             issues.append({"code": "record_unusable", "record_id": rid, "status": row["status"]})
-            usable = False
-        corrections = set(self.reverse[rid])
-        for key in CORRECTIONS:
-            corrections.update(_refs(row.get(key, [])))
-        if corrections:
-            issues.append({"code": "record_has_correction", "record_id": rid, "record_refs": sorted(corrections)})
             usable = False
         if row.get("status", "").casefold() in TENTATIVE:
             issues.append({"code": "record_tentative", "record_id": rid})
@@ -110,12 +139,8 @@ class _Sources:
             sid = source if isinstance(source, str) else source["id"]
             linked = self.corpus.records.get(sid)
             if linked is None:
-                issues.append({"code": "missing_source_record", "record_id": rid, "source_id": sid})
                 usable = False
                 continue
-            if isinstance(source, dict) and source.get("revision", linked.get("revision")) != linked.get("revision"):
-                issues.append({"code": "stale_source", "record_id": rid, "source_id": sid})
-                usable = False
             found = self.inspect(sid, (*trail, rid))
             observations.update(found["observations"])
             issues.extend(found["issues"])
@@ -130,18 +155,7 @@ class _Sources:
 
 
 def _constraint_check(provide, need):
-    supplied, required = provide.get("constraints", {}), need.get("constraints", {})
-    conflicts, unknown = [], []
-    for key in sorted(supplied.keys() | required.keys()):
-        left, right = supplied.get(key), required.get(key)
-        if left in (None, "") or right in (None, ""):
-            unknown.append({"constraint": key, "provided": left, "required": right,
-                            "reason": "constraint_not_declared_on_both_sides"})
-        elif left != right:
-            conflicts.append({"constraint": key, "provided": left, "required": right})
-    if not supplied and not required:
-        unknown.append({"reason": "no_constraints_declared"})
-    return conflicts, unknown
+    return check_conditions(provide.get("constraints", {}), need.get("constraints", {}))
 
 
 def _seeds(corpus, query, anchors, changed):
@@ -168,7 +182,7 @@ def _seeds(corpus, query, anchors, changed):
                 if ref in row.get("subject_refs", []) or ref in _refs(row.get("observation_refs", [])):
                     seeds.add(rid)
     if query.strip():
-        terms = set(_terms(query))
+        terms = query_terms(query, _terms)
         if metadata is not None:
             seeds.update(metadata.union("seed_term", terms))
         for rid, row in (() if metadata is not None else records.items()):
@@ -264,7 +278,8 @@ def _matching_edges(records, seeds, focused, sources, review_seeds=()):
     def usable(rid):
         if rid not in viable:
             row = records[rid]
-            viable[rid] = not (row.get("status", "").casefold() in UNUSABLE
+            viable[rid] = not (row.get("basis_status") == "needs_review"
+                               or row.get("status", "").casefold() in UNUSABLE
                                or sources.reverse[rid]
                                or any(row.get(key) for key in CORRECTIONS))
         return viable[rid]
