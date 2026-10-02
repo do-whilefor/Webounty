@@ -18,7 +18,8 @@ import sys
 sys.dont_write_bytecode = True
 
 from methods import select_methods
-from search_index import rank as rank_corpus
+from search_index import rank as rank_corpus, RANKING_VERSION
+from ranking_context import mirror_owner
 from telemetry import count, measure as stage_measure
 from context_views import (compact_artifact, compact_block, compact_mandatory,
                            compact_navigation, compact_observation, compact_record)
@@ -861,7 +862,8 @@ def retrieve(root, run_id, query, anchors=(), budget_chars=None, max_candidates=
                                method_units, method_issues, cross_limit=cross_limit, related_only=view == "compact",
                                view=view, mode=mode)
             result["budget"]["limit_chars"] = budget_chars
-            result["retrieval_request"] = {"mode": mode, "query": query, "anchors": sorted(set(anchors)),
+            result["retrieval_request"] = {"mode": mode, "ranking_version": RANKING_VERSION,
+                "query": query, "anchors": sorted(set(anchors)),
                 "question_ref": question_ref, "max_candidates": max_candidates,
                 "cross_limit": cross_limit, "include_methods": include_methods,
                 "method_ids": sorted(method_ids), "method_intents": sorted(method_intents),
@@ -924,7 +926,9 @@ def _retrieve(corpus, query, anchors, budget_chars, max_candidates,
     blockers = corpus.records_with_flag("blockers")
     diagnostics = list(corpus.load_issues) + list(search_issues) + list(method_issues) + list(chain.get("issues", []))
     navigation, fresh_keys, unclassified_keys, checks = [], [], [], []
-    relevant_pages = sorted({corpus.blocks[key]["page_id"] for kind, key in ranked + related_blocks if kind == "block"})
+    mirror_keys = list(getattr(corpus, "retrieval_mirrors", {}))
+    relevant_pages = sorted({corpus.blocks[key]["page_id"]
+                             for kind, key in ranked + related_blocks + mirror_keys if kind == "block"})
     # Preserve freshness scanning independently of packing limits. Global uncertain
     # material is surfaced after exact requests, needed relations and normal hits.
     for pid in relevant_pages:
@@ -981,7 +985,12 @@ def _retrieve(corpus, query, anchors, budget_chars, max_candidates,
         diagnostics.append({"code": "no_hit", "detail": "没有定位到相关资料；不表示反证或已覆盖。"})
         navigation = [{"page_id": pid, "path": page["path"], "retrieval_reason": "仅目录导航，未命中"}
                       for pid, page in sorted(corpus.pages.items())]
-    ordered = list(dict.fromkeys(exact_order + relation_keys + related_blocks + ranked + fresh_keys + unclassified_keys))
+    ordered = []
+    for key in exact_order + relation_keys + related_blocks + ranked + fresh_keys + unclassified_keys:
+        owner = mirror_owner(corpus, key[1], exact) if key[0] == "block" else None
+        # Page freshness checks above and package validation below remain active.
+        ordered.append(owner or key)
+    ordered = list(dict.fromkeys(ordered))
     out = {"run_id": corpus.run_id, "state_revision": corpus.state["revision"], "query": query,
            "status": "ready", "mandatory_context": {"goals": goals, "blockers": blockers},
            "blocks": [], "records": [], "observations": [], "entities": [], "artifacts": [],

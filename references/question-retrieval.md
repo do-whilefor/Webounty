@@ -68,9 +68,11 @@ needs 未填写时返回 not_declared；词法模式没有检查 needs 时返回
 
 写入时保留 summary、questions、keywords、aliases 和标题路径之间的区别。summary 描述已观察事实及适用对象；questions 保存可能需要查询的问题；aliases 仅保存确实同义的名称。让原始 `job_id` 带上已知的接口、身份和业务背景，但不要把“能否下载”改写成“已经可以下载”。新表述需通过 record 入库，沿用原有增量索引。
 
-这些字段能改善已表达概念的词法召回，不能保证找回没有共同词项、别名或显式关系的语义近似内容。先用真实漏召回案例检验，再决定是否增加模型依赖。
+这些字段与少量本地中英术语扩展共同改善召回，词表之外仍不能保证找回没有共同词项、别名或显式关系的语义近似内容。查询扩展只增加候选，不改变已声明的能力类型；需要精确字符串时使用引号或反引号。显式传入 current-conditions 可辅助排序，但不能替代对照观察、否定条件和现场验证。具体规则和命中理由见 [检索与链路组合](retrieval.md)。
 
 ## 验证
+
+`python3 -B -m unittest discover -s tests -p 'test_local_*.py'` 验证无模型查询扩展、短语排序、缓存更新、条件匹配、镜像去重、反证补齐和原件校验。`python3 -B tests/evaluate_local_ranking.py` 在固定虚构案例上报告排序与召回指标；通过 `--scripts-dir '旧版scripts目录'` 使用同一语料对照。案例覆盖范围和样本量有限，不表示真实研究准确率。
 
 `python3 -B -m unittest discover -s tests -p 'test_question_workflow.py'` 回放前提缺失、新提供者、更正、单输入上游检查、词法模式反证补齐、重复查询、refresh、会话隔离、预算不足和原件篡改；同时验证问题元数据参与召回而不改变证据状态。
 

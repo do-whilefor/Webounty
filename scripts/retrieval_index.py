@@ -12,8 +12,10 @@ import hashlib
 import json
 import sqlite3
 
+from lexical_proximity import pairs, lexical_length
 
-FORMAT_VERSION = "3"
+
+FORMAT_VERSION = "4"
 
 
 def _encode(value):
@@ -145,6 +147,13 @@ class _Signatures:
             # must be checked to detect unsanctioned edits and broken anchors.
             values.extend(({k: v for k, v in page.items() if k != "blocks"},
                            self.file(page["path"]), self.corpus.navigation_paths[row["page_id"]]))
+            if row.get("representation") == "record":
+                # Current mirror text is projected from the owner, including
+                # external edits that did not advance its declared revision.
+                for ref in row.get("source_refs", []):
+                    rid = ref if isinstance(ref, str) else ref["id"]
+                    self.refs.add("id:" + rid)
+                    values.append(self.corpus.records.get(rid))
             if row.get("knowledge"):
                 values.append(self.linked_sources(row))
         elif kind == "observation":
@@ -214,7 +223,7 @@ def _clear_document(connection, doc_id):
 
 
 def _add_field(connection, doc_id, field, counts):
-    length = sum(counts.values())
+    length = lexical_length(counts)
     if not length:
         return
     connection.execute("INSERT INTO fields VALUES(?,?,?)", (doc_id, field, length))
@@ -259,7 +268,8 @@ def _changed_keys(connection, documents, refs, keys):
     return result
 
 
-def lexical_projection(corpus, documents, query_terms, fields_for, tokenize, role_for, *, changes=None):
+def lexical_projection(corpus, documents, query_terms, fields_for, tokenize, role_for, *, changes=None,
+                       original_terms=None):
     """Consume publication changes, reconcile external edits, then fetch only query postings."""
     from wiki_structure import navigation_paths
 
@@ -332,6 +342,7 @@ def lexical_projection(corpus, documents, query_terms, fields_for, tokenize, rol
                 counts = field_cache.get(value)
                 if counts is None:
                     counts = Counter(tokenize(value))
+                    counts.update(pairs(value))
                     totals["tokenized_fields"] += 1
                     if len(value) <= 4096 and len(field_cache) < 128:
                         field_cache[value] = counts
@@ -348,8 +359,10 @@ def lexical_projection(corpus, documents, query_terms, fields_for, tokenize, rol
         averages = {field: total / number for field, total, number in connection.execute(
             "SELECT field, total_length, documents FROM field_totals WHERE documents>0")}
         postings, field_lengths = defaultdict(dict), defaultdict(dict)
-        connection.execute("CREATE TEMP TABLE query_terms (term TEXT PRIMARY KEY)")
-        connection.executemany("INSERT INTO query_terms VALUES(?)", ((term,) for term in query_terms))
+        original_terms = set(query_terms) if original_terms is None else original_terms
+        connection.execute("CREATE TEMP TABLE query_terms (term TEXT PRIMARY KEY, original INTEGER NOT NULL)")
+        connection.executemany("INSERT INTO query_terms VALUES(?,?)",
+                               ((term, int(term in original_terms)) for term in query_terms))
         for term, kind, rid, field, count, length, role, usable in connection.execute("""
             SELECT t.term, d.kind, d.rid, t.field, t.count, f.length, d.role, d.usable
             FROM query_terms q JOIN terms t ON t.term=q.term
@@ -364,18 +377,19 @@ def lexical_projection(corpus, documents, query_terms, fields_for, tokenize, rol
                 if not usable:
                     unavailable.add(key)
         corpus.retrieval_source_matches = {}
-        for oid, aid, offset, length, checksum, matches in connection.execute("""
-            SELECT d.rid, c.artifact_id, c.byte_offset, c.byte_length, c.sha256, COUNT(*)
+        for oid, aid, offset, length, checksum, matches, original_matches in connection.execute("""
+            SELECT d.rid, c.artifact_id, c.byte_offset, c.byte_length, c.sha256, COUNT(*), SUM(q.original)
             FROM query_terms q JOIN source_terms t ON q.term=t.term
             JOIN source_chunks c ON c.doc_id=t.doc_id AND c.chunk_index=t.chunk_index
             JOIN documents d ON d.doc_id=c.doc_id
-            GROUP BY c.doc_id,c.chunk_index ORDER BY COUNT(*) DESC,c.byte_offset
+            GROUP BY c.doc_id,c.chunk_index ORDER BY SUM(q.original) DESC,COUNT(*) DESC,c.byte_offset
         """):
             hit = corpus.retrieval_source_matches.get(oid)
             if hit is None:
                 corpus.retrieval_source_matches[oid] = {
                     "artifact_id": aid, "offset": offset, "length": length, "sha256": checksum,
-                    "matched_query_terms": matches, "matching_chunks": 1, "selection": "representative_window",
+                    "matched_query_terms": matches, "matched_original_query_terms": original_matches,
+                    "matching_chunks": 1, "selection": "representative_window",
                     "evidence": False}
             else:
                 hit["matching_chunks"] += 1

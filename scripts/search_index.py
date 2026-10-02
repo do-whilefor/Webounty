@@ -7,6 +7,13 @@ from math import log1p
 import re
 import unicodedata
 
+from lexical_proximity import pairs, lexical_length
+from query_expansion import expand_query
+from ranking_context import condition_signal, mirror_owner
+
+
+RANKING_VERSION = "local-2"
+
 
 _TOKENS = re.compile(r"[a-z0-9_]+(?:[-/.][a-z0-9_]+)*|[\u3400-\u9fff]+", re.I)
 _CAMEL = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
@@ -195,6 +202,11 @@ def _fields(kind, row, corpus):
             corpus.ensure_page(row["page_id"])
         page = corpus.pages[row["page_id"]]
         body = _MARKDOWN_LINK.sub(r"\1", _ANCHOR_TAG.sub("", row["text"]))
+        owner = mirror_owner(corpus, row["page_id"] + "/" + row["block_id"])
+        if owner is not None:
+            # Generated Markdown includes revision history. Search the current
+            # authoritative claim, so an old summary cannot revive its owner.
+            body = _record_text(corpus.records[owner[1]])
         heading = _HEADING.search(body)
         retrieval = row.get("retrieval", {})
         result = {name: _text(row.get(name, retrieval.get(name, "")))
@@ -316,24 +328,48 @@ def rank(corpus, query, anchors, *, with_exact=False, with_reasons=False):
                     if may_occur(identifier):
                         identifiers[identifier].add(key)
 
-    terms = query_terms(query)
+    original_terms = query_terms(query)
+    expanded = expand_query(query, _terms, original_terms)
+    term_weights = {**expanded, **dict.fromkeys(original_terms, 1.0)}
+    query_pairs = pairs(query, original_terms)
+    terms = set(term_weights) | query_pairs.keys()
     if terms and hasattr(corpus, "root"):
         from retrieval_index import lexical_projection
         postings, field_lengths, averages, roles, unavailable = lexical_projection(
-            corpus, documents, terms, _fields, _terms, _role)
+            corpus, documents, terms, _fields, _terms, _role, original_terms=original_terms)
     elif metadata is not None and not terms:
         postings, field_lengths, averages, roles, unavailable = {}, {}, {}, {}, set()
     else:
         postings, field_lengths, averages, roles, unavailable = _memory_projection(corpus, documents, terms)
     scores = defaultdict(float)
-    for term in sorted(terms):
+    matching_terms, expanded_hits = defaultdict(set), defaultdict(set)
+    signal_reasons = defaultdict(list)
+    for term in sorted(term_weights):
         found = postings.get(term, {})
         idf = log1p((len(documents) - len(found) + 0.5) / (len(found) + 0.5))
         for key, fields in found.items():
             weighted_tf = sum(_WEIGHTS[field] * count /
                               (0.25 + 0.75 * field_lengths[key][field] / averages[field])
                               for field, count in fields.items())
-            scores[key] += idf * weighted_tf * 2.2 / (1.2 + weighted_tf)
+            scores[key] += term_weights[term] * idf * weighted_tf * 2.2 / (1.2 + weighted_tf)
+            (matching_terms if term in original_terms else expanded_hits)[key].add(term)
+    pair_hits = defaultdict(float)
+    for term, requested_strength in query_pairs.items():
+        for key, fields in postings.get(term, {}).items():
+            pair_hits[key] += min(requested_strength, max(fields.values()))
+    pair_total = sum(query_pairs.values())
+    for key in scores:
+        coverage = len(matching_terms[key]) / len(original_terms) if original_terms else 0
+        proximity = pair_hits[key] / pair_total if pair_total else 0
+        scores[key] *= 1 + 0.2 * coverage + 0.35 * proximity
+        if expanded_hits[key]:
+            signal_reasons[key].append({"kind": "query_expansion", "matched_terms": sorted(expanded_hits[key])})
+        if proximity:
+            signal_reasons[key].append({"kind": "ordered_proximity", "coverage": round(proximity, 6)})
+        signal = condition_signal(corpus, key, documents[key])
+        if signal is not None:
+            scores[key] *= signal["multiplier"]
+            signal_reasons[key].append({"kind": "execution_conditions", **signal})
 
     # IDs use word/hyphen tokens plus literal separators. This recognizes nested
     # block references and overlapping IDs while retaining the previous boundaries.
@@ -402,6 +438,23 @@ def rank(corpus, query, anchors, *, with_exact=False, with_reasons=False):
     # either statement is true. A directly requested ID/alias still comes first.
     best_score = max(scores.values(), default=0)
     focus = exact | {key for key, score in scores.items() if score == best_score}
+    # Lower-ranked claims also need their competing records, but must not
+    # promote unrelated corrections ahead of the query's strongest matches.
+    correction_links = defaultdict(set)
+    all_hits = scores.keys() | exact
+    all_record_hits = {rid for kind, rid in all_hits if kind == "record"}
+    for kind, rid in all_hits:
+        if kind == "block":
+            all_record_hits.update(_refs(corpus.blocks[rid].get("source_refs", [])))
+    for rid in sorted(all_record_hits & corpus.records.keys()):
+        for field in ("corrected_by", "superseded_by", "correction_refs", "contradicted_by", "contradicts"):
+            correction_links[rid].update(_refs(corpus.records[rid].get(field, [])))
+        if metadata is not None:
+            correction_links[rid].update(metadata.links("contradiction")[rid])
+    if metadata is None:
+        for rid, row in corpus.records.items():
+            for target in all_record_hits & _refs(row.get("contradicts", [])):
+                correction_links[target].add(rid)
     hit_records = {rid for kind, rid in focus if kind == "record"}
     for kind, rid in focus:
         if kind == "block":
@@ -437,6 +490,7 @@ def rank(corpus, query, anchors, *, with_exact=False, with_reasons=False):
         block_rows = ((bid, corpus.blocks[bid]) for bid in sorted(block_ids))
     else:
         block_rows = corpus.blocks.items()
+    mirrors = {}
     for bid, block in block_rows:
         key = "block", bid
         role = roles.get(key, _role(block) if metadata is not None and not terms else block.get("role", "explanation"))
@@ -448,14 +502,16 @@ def rank(corpus, query, anchors, *, with_exact=False, with_reasons=False):
             continue
         # Generated pages mirror a record, not a second independent judgment.
         # Let their searchable prose locate that record without summing copies.
-        owners = _refs(block.get("source_refs", []))
-        if block.get("representation") == "record" and len(owners) == 1 and key in scores:
-            owner = next(iter(owners))
-            sources_current = all(not isinstance(ref, dict) or
-                                  ref.get("revision") == corpus.records[ref["id"]].get("revision")
-                                  for ref in block.get("source_refs", []))
-            if ("record", owner) in scores and sources_current:
-                scores[("record", owner)] = max(scores[("record", owner)], scores[key])
+        owner = mirror_owner(corpus, bid, exact)
+        if owner is not None and (key in scores or key in priorities):
+            mirrors[key] = owner
+            if scores.get(key, 0) > scores.get(owner, 0):
+                signal_reasons[owner] = list(signal_reasons[key])
+            scores[owner] = max(scores.get(owner, 0), scores.get(key, 0))
+            signal_reasons[owner].append({"kind": "record_mirror", "block_ref": bid})
+            scores.pop(key, None)
+            priorities.pop(key, None)
+            continue
         page = corpus.pages[block["page_id"]]
         direct = bool(exact_ids & _refs(block.get("source_refs", [])))
         scoped = bool(subjects & _refs(block.get("subject_refs", page.get("subject_refs", []))))
@@ -464,6 +520,23 @@ def rank(corpus, query, anchors, *, with_exact=False, with_reasons=False):
             relation_reasons[key] = "source_relation" if direct else "subject_relation"
     ranked = sorted(scores.keys() | priorities.keys(),
                     key=lambda key: (-priorities.get(key, 0), -scores.get(key, 0), key[0] != "record", key))
+    corpus.retrieval_mirrors = mirrors
+    ordered = [key for key in ranked if key in exact]
+    seen = set(ordered)
+    for key in ranked:
+        if key not in seen:
+            ordered.append(key)
+            seen.add(key)
+        parents = ([key[1]] if key[0] == "record" else
+                   _refs(corpus.blocks[key[1]].get("source_refs", [])) if key[0] == "block" else [])
+        for rid in sorted({rid for parent in parents for rid in correction_links[parent]}):
+            related = ("record", rid)
+            if rid not in corpus.records or related in seen or related in exact:
+                continue
+            ordered.append(related)
+            seen.add(related)
+            relation_reasons.setdefault(related, "counterevidence_relation")
+    ranked = ordered
     result = (ranked, issues, exact) if with_exact else (ranked, issues)
     if with_reasons:
         reasons = {}
@@ -477,6 +550,7 @@ def rank(corpus, query, anchors, *, with_exact=False, with_reasons=False):
                 items.append({"kind": relation_reasons[key]})
             if key in scores:
                 items.append({"kind": "lexical", "score": round(scores[key], 6)})
+            items.extend(signal_reasons[key])
             reasons[key] = items
         return (*result, reasons)
     return result
@@ -501,7 +575,8 @@ def _memory_projection(corpus, documents, terms):
                 continue
             if value not in field_cache:
                 counts = Counter(_terms(value))
-                field_cache[value] = (sum(counts.values()), {term: counts[term] for term in counts.keys() & terms})
+                counts.update(pairs(value))
+                field_cache[value] = (lexical_length(counts), {term: counts[term] for term in counts.keys() & terms})
             length, matches = field_cache[value]
             if not length:
                 continue
