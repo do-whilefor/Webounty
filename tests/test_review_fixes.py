@@ -148,7 +148,8 @@ class ReviewFixesTests(unittest.TestCase):
                  [{"id": "O", "content": {"response": 403}}])
         with Corpus(self.root, self.run) as corpus:
             ranked, _ = rank(corpus, "Diagnostic needle", [])
-            self.assertLess(ranked.index(("record", "F")), ranked.index(("block", "WK-F/B-F")))
+            self.assertIn(("record", "F"), ranked)
+            self.assertNotIn(("block", "WK-F/B-F"), ranked)
             exact, _ = rank(corpus, "", ["WK-F/B-F"])
             self.assertEqual(exact[0], ("block", "WK-F/B-F"))
 
