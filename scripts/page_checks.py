@@ -26,14 +26,36 @@ def _status(check):
     return check
 
 
+def _saved_pages(path, run_id):
+    """Discard damaged derived entries; authoritative inputs are checked normally."""
+    try:
+        saved = json.loads(path.read_bytes())
+    except (OSError, ValueError, UnicodeError):
+        return {}
+    if (not isinstance(saved, dict) or saved.get("version") != VERSION
+            or saved.get("run_id") != run_id or not isinstance(saved.get("pages"), dict)):
+        return {}
+    pages = {}
+    for pid, entry in saved["pages"].items():
+        if not isinstance(entry, dict) or not isinstance(entry.get("check"), dict):
+            continue
+        check = entry["check"]
+        if check.get("page_id") != pid or check.get("status") not in ("ready", "review_required", "unavailable"):
+            continue
+        fields = {"issues": ("code",), "new_candidates": ("kind", "id"), "removed_candidates": ("kind", "id")}
+        if all(isinstance(check.get(field), list) and all(
+                isinstance(row, dict) and all(isinstance(row.get(key), str) for key in keys)
+                for row in check[field]) for field, keys in fields.items()):
+            pages[pid] = entry
+    return pages
+
+
 class PageChecks:
     def __init__(self, corpus, metrics=None):
         self.corpus = corpus
         self.metrics = metrics
         path = corpus.path(CACHE_PATH)
-        saved = json.loads(path.read_bytes()) if path.exists() else {}
-        self.previous = (saved.get("pages", {}) if saved.get("version") == VERSION
-                         and saved.get("run_id") == corpus.run_id else {})
+        self.previous = _saved_pages(path, corpus.run_id)
         self.entries = {}
         self.file_states = {}
         self.goals_by_subject = {}

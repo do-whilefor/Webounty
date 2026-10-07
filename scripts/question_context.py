@@ -7,7 +7,7 @@ from discovery import _Sources, _refs
 def assess_question(corpus, question_ref, result, *, mode):
     report = {"question_ref": question_ref, "assessment": "mechanical_checks_only",
               "evidence": False, "answer_support": "not_assessed",
-              "source_observation_refs": [], "source_issues": [],
+              "source_observation_refs": [], "source_artifact_refs": [], "source_issues": [],
               "requirements": {"status": "not_checked"}, "next_actions": []}
     # Do not interpret missing packages or truncated plans as absent evidence.
     if (result["status"] == "unavailable" or result["budget"].get("omitted_units")
@@ -20,6 +20,7 @@ def assess_question(corpus, question_ref, result, *, mode):
     row = corpus.records[question_ref]
     checked = _Sources(corpus).inspect(question_ref)
     report["source_observation_refs"] = sorted(checked["observations"])
+    report["source_artifact_refs"] = sorted(checked["artifacts"])
     report["source_issues"] = checked["issues"]
     report["declared_conditions"] = row.get("conditions", {})
     # These are navigation to competing claims, not automatic acceptance of them.
@@ -27,10 +28,10 @@ def assess_question(corpus, question_ref, result, *, mode):
     for issue in checked["issues"]:
         competing.update(issue.get("record_refs", []))
     report["competing_record_refs"] = sorted(competing)
-    read_refs = sorted({question_ref, *checked["observations"], *competing})
+    read_refs = sorted({question_ref, *checked["observations"], *checked["artifacts"], *competing})
     report["next_actions"].append({"command": "read", "ids": read_refs,
                                    "reason": "check_original_support_and_applicability"})
-    if not checked["observations"]:
+    if not checked["observations"] and not checked["artifacts"]:
         report["next_actions"].append({"command": "context", "mode": "lexical",
             "reason": "locate_existing_observations_before_requesting_new_experiment"})
 

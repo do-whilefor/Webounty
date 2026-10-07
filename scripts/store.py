@@ -701,6 +701,9 @@ def publish(root, run_id, batch, metrics=None):
         raise RetrievalError("publication must be an object")
     with measure(metrics, "publish.load"):
         current = Corpus(root, run_id, lazy_pages=True, metrics=metrics)
+        if current.load_issues:
+            current.close()
+            raise RetrievalError("refusing to publish with unreadable authoritative indexes: " + encode(current.load_issues))
         from retrieval_index import snapshot, sync_publication
         current.index_snapshot = snapshot(current)
     with measure(metrics, "publish.prepare"):

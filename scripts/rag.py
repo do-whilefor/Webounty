@@ -129,6 +129,7 @@ class Corpus:
         self.load_issues = []
         self.page_issues = defaultdict(list)
         self.art_cache, self.obs_cache, self.check_cache, self.line_cache = {}, {}, {}, {}
+        self.observation_status = {}
         self.closure_cache, self.knowledge_check_cache, self.reasoning_cache = {}, {}, {}
         self.loaded_pages = set()
         # The nested layout is canonical; the root manifest supports early fixtures.
@@ -414,6 +415,10 @@ class Corpus:
         aid = self.observations[oid].get("source_artifact_id")
         if not aid:
             return
+        if oid not in self.observation_status:
+            self.observation(oid)
+        if self.observation_status[oid] != "ready":
+            return
         artifact = self.artifact(aid)
         if artifact["status"] != "ready" or artifact["provenance"].get("text_encoding") != "utf-8":
             return
@@ -423,13 +428,14 @@ class Corpus:
     def release_observation(self, oid):
         """Indexing one observation must not retain all previous raw payloads."""
         self.obs_cache.pop(oid, None)
+        self.observation_status.pop(oid, None)
         aid = self.observations[oid]["artifact_id"]
         self.art_cache.pop(aid, None)
         self.line_cache.pop(aid, None)
 
     def observation(self, oid):
         if oid in self.obs_cache:
-            return self.obs_cache[oid]
+            return self._observation_match(oid, self.obs_cache[oid])
         index = self.observations[oid]
         artifact = self.artifact(index["artifact_id"])
         issues, raw = list(artifact["issues"]), None
@@ -453,6 +459,16 @@ class Corpus:
                             raise RetrievalError("观察原件混入其他 run_id")
                         if raw.get("observation_id") != oid:
                             issues.append({"code": "observation_id_mismatch", "id": oid})
+                        source = raw.get("source_artifact")
+                        source_id = index.get("source_artifact_id")
+                        if source_id or source is not None:
+                            # The sealed observation binds the imported original;
+                            # a valid hash on an unrelated artifact is insufficient.
+                            meta = self.artifacts.get(source_id, {})
+                            if (not source_id or not isinstance(source, dict)
+                                    or source.get("artifact_id") != source_id
+                                    or any(source.get(key) != meta.get(key) for key in ("path", "sha256"))):
+                                issues.append({"code": "observation_source_mismatch", "id": oid})
                     except (json.JSONDecodeError, UnicodeError):
                         issues.append({"code": "observation_parse_error", "id": oid})
         out = {"id": oid, "revision": index["revision"], "index": index,
@@ -464,11 +480,17 @@ class Corpus:
         if out["status"] == "ready" and index.get("excerpt_selectors"):
             from excerpts import observation_excerpts
             out["excerpts"] = observation_excerpts(self, out)
-        if oid in getattr(self, "retrieval_source_matches", {}):
-            out["source_match"] = self.retrieval_source_matches[oid]
+        self.observation_status[oid] = out["status"]
         if self.artifacts.get(index["artifact_id"], {}).get("bytes", 0) <= self.CACHE_FILE_BYTES:
             self.obs_cache[oid] = out
-        return out
+        return self._observation_match(oid, out)
+
+    def _observation_match(self, oid, observation):
+        # Source windows belong to the current query, never the observation cache.
+        hit = getattr(self, "retrieval_source_matches", {}).get(oid)
+        if observation["status"] == "ready" and hit is not None:
+            return {**observation, "source_match": dict(hit)}
+        return observation
 
     def artifact_lines(self, aid, data):
         if len(data) > self.CACHE_FILE_BYTES:

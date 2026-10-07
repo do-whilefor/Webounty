@@ -15,7 +15,7 @@ import sqlite3
 from lexical_proximity import pairs, lexical_length
 
 
-FORMAT_VERSION = "4"
+FORMAT_VERSION = "5"
 
 
 def _encode(value):
@@ -261,9 +261,11 @@ def _changed_keys(connection, documents, refs, keys):
     connection.execute("CREATE TEMP TABLE changed_refs (ref TEXT PRIMARY KEY)")
     connection.executemany("INSERT INTO changed_refs VALUES(?)", ((ref,) for ref in refs))
     result = set(keys)
+    # Temp tables have no cardinality statistics. Keep the small change set as
+    # the outer loop; an ordinary JOIN can scan every persisted dependency.
     result.update((kind, rid) for kind, rid in connection.execute("""
         SELECT DISTINCT d.kind, d.rid FROM changed_refs c
-        JOIN dependencies x ON x.ref=c.ref JOIN documents d ON d.doc_id=x.doc_id
+        CROSS JOIN dependencies x ON x.ref=c.ref JOIN documents d ON d.doc_id=x.doc_id
     """))
     return result
 
@@ -363,9 +365,12 @@ def lexical_projection(corpus, documents, query_terms, fields_for, tokenize, rol
         connection.execute("CREATE TEMP TABLE query_terms (term TEXT PRIMARY KEY, original INTEGER NOT NULL)")
         connection.executemany("INSERT INTO query_terms VALUES(?,?)",
                                ((term, int(term in original_terms)) for term in query_terms))
+        # Drive both lookups with the query, not the complete inverted index.
+        # CROSS JOIN preserves that order even without ANALYZE statistics for
+        # these per-request temp tables; equality still uses the term indexes.
         for term, kind, rid, field, count, length, role, usable in connection.execute("""
             SELECT t.term, d.kind, d.rid, t.field, t.count, f.length, d.role, d.usable
-            FROM query_terms q JOIN terms t ON t.term=q.term
+            FROM query_terms q CROSS JOIN terms t ON t.term=q.term
             JOIN documents d ON d.doc_id=t.doc_id
             JOIN fields f ON f.doc_id=t.doc_id AND f.field=t.field
         """):
@@ -379,7 +384,7 @@ def lexical_projection(corpus, documents, query_terms, fields_for, tokenize, rol
         corpus.retrieval_source_matches = {}
         for oid, aid, offset, length, checksum, matches, original_matches in connection.execute("""
             SELECT d.rid, c.artifact_id, c.byte_offset, c.byte_length, c.sha256, COUNT(*), SUM(q.original)
-            FROM query_terms q JOIN source_terms t ON q.term=t.term
+            FROM query_terms q CROSS JOIN source_terms t ON q.term=t.term
             JOIN source_chunks c ON c.doc_id=t.doc_id AND c.chunk_index=t.chunk_index
             JOIN documents d ON d.doc_id=c.doc_id
             GROUP BY c.doc_id,c.chunk_index ORDER BY SUM(q.original) DESC,COUNT(*) DESC,c.byte_offset

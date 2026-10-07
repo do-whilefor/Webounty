@@ -25,6 +25,7 @@ question-ref 必须是当前会话已有的记录 ID，自动加入 anchor，可
 | 字段 | 含义 |
 | --- | --- |
 | source_observation_refs | 沿该记录已声明的来源关系找到、可读取的观察；其中可能包含前提或历史依据，不表示直接证明了答案 |
+| source_artifact_refs | 沿该记录及上游来源的 artifact_refs 找到、通过完整性和定位检查的原件 ID；可用 read 精读，不表示已核实答案 |
 | source_issues | 来源缺失、旧修订、待复核状态、显式更正等诊断 |
 | competing_record_refs | 指向竞争判断或更正的精读入口，不自动接受其中任何一方 |
 | declared_conditions | 问题记录声明的条件；传入 --current-conditions 时检查对应轴，其他适用性仍由宿主核对 |
@@ -34,6 +35,8 @@ question-ref 必须是当前会话已有的记录 ID，自动加入 anchor，可
 | answer_support | 固定 not_assessed：没有自动判断这些材料能否支持答案 |
 
 needs 未填写时返回 not_declared；词法模式没有检查 needs 时返回 not_checked，并建议 combined。单输入也使用递归前提规划，不能因直接提供者存在就忽略它自己的前提。多输入复用现有 AND/OR 组合规划。candidate_complete 仅说明选中的候选方案通过已声明条件检查，仍须验证实际产物被消费、身份和版本适用，以及最终结果。代表方案有缺口时，也不能据此否定所有 OR 备选。
+
+显式引用的原件损坏或行位置失效时，该来源不能用于补齐候选方案；诊断同时出现在来源检查和候选链中。只引用原件而未建立观察的记录不会被误报为没有任何来源，next_actions 会包含相应原件 ID。
 
 若返回包不可用、存在材料遗漏或问题记录未被返回，检查报告明确标为 question_context_incomplete，不把截断后的空列表解释成没有前提或证据。报告本身参与显式字符预算；装不下时返回 budget_exhausted，不推进 cursor。
 

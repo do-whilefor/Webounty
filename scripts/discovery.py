@@ -99,7 +99,7 @@ class _Sources:
                 issues.append({"code": "stale_source", "record_id": rid, "source_id": sid,
                                "expected": source["revision"], "current": linked.get("revision")})
         current = getattr(self.corpus, "current_conditions", {})
-        if current and (row.get("conditions") or row.get("capability") or row.get("observation_refs") or _support_refs(row)):
+        if current and (row.get("conditions") or row.get("capability") or row.get("observation_refs") or row.get("artifact_refs") or _support_refs(row)):
             declared = dict(row.get("conditions", {}))
             # Only an explicitly declared common execution context is compared.
             # Capability input/output constraints can legitimately describe other actors.
@@ -115,9 +115,11 @@ class _Sources:
         if rid in self.cache:
             return self.cache[rid]
         if rid in trail:
-            return {"observations": set(), "issues": [{"code": "source_cycle", "record_id": rid}], "usable": False}
+            return {"observations": set(), "artifacts": set(),
+                    "issues": [{"code": "source_cycle", "record_id": rid}], "usable": False}
         row = self.corpus.records[rid]
         issues, observations = self.basis_issues(rid), set()
+        artifacts = set()
         usable = not issues
         if row.get("status", "").casefold() in UNUSABLE:
             issues.append({"code": "record_unusable", "record_id": rid, "status": row["status"]})
@@ -135,6 +137,13 @@ class _Sources:
             else:
                 issues.append({"code": "observation_unavailable", "record_id": rid, "observation_id": oid})
                 usable = False
+        for ref in row.get("artifact_refs", []):
+            artifact_issues = self.corpus.artifact_reference_issues(ref)
+            if artifact_issues:
+                issues.extend({**issue, "record_id": rid} for issue in artifact_issues)
+                usable = False
+            else:
+                artifacts.add(ref["artifact_id"])
         for source in _support_refs(row):
             sid = source if isinstance(source, str) else source["id"]
             linked = self.corpus.records.get(sid)
@@ -143,11 +152,12 @@ class _Sources:
                 continue
             found = self.inspect(sid, (*trail, rid))
             observations.update(found["observations"])
+            artifacts.update(found["artifacts"])
             issues.extend(found["issues"])
             usable = usable and found["usable"]
-        if not observations:
+        if not observations and not artifacts:
             issues.append({"code": "no_source_evidence", "record_id": rid})
-        result = {"observations": observations, "issues": issues, "usable": usable}
+        result = {"observations": observations, "artifacts": artifacts, "issues": issues, "usable": usable}
         # A result containing a cycle depends on the call trail; avoid memoizing it.
         if not any(issue["code"] == "source_cycle" for issue in issues):
             self.cache[rid] = result
@@ -426,6 +436,7 @@ def discover(corpus, query="", anchors=(), changed=()):
                            "reason": reason, "matched_names": sorted(provided_names[(pid, pindex)] & needed_names[(cid, nindex)]),
                            "evidence": False, "record_refs": [pid, cid],
                            "observation_refs": sorted(producer["observations"] | consumer["observations"]),
+                           "artifact_refs": sorted(producer["artifacts"] | consumer["artifacts"]),
                            "source_issues": source_issues,
                            "producer_usable": producer["usable"], "consumer_usable": consumer["usable"]})
 

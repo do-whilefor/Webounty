@@ -287,6 +287,8 @@ def _role(block):
 
 def rank(corpus, query, anchors, *, with_exact=False, with_reasons=False):
     """Return ranked references; lexical candidates never establish evidence validity."""
+    # Source windows belong to this query, including empty/anchor-only requests.
+    corpus.retrieval_source_matches = {}
     anchor_list = list(anchors)
     exact_inputs = [original.casefold() for original in [query] + anchor_list]
     # A necessary substring condition, not a match: keep boundary/ambiguity
